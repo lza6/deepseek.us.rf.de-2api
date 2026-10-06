@@ -11,12 +11,17 @@
 //! - `api`      axum 路由与处理器
 //! - `protocol` OpenAI/Anthropic 协议翻译
 
+pub mod admin;
 pub mod api;
 pub mod auth;
+pub mod cache;
 pub mod config;
 pub mod errors;
+pub mod features;
+pub mod ledger;
 pub mod models;
 pub mod protocol;
+pub mod replay;
 pub mod session;
 pub mod solver;
 pub mod upstream;

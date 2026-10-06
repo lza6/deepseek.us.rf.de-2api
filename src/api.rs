@@ -1,11 +1,15 @@
 //! HTTP 路由与处理器：OpenAI + Anthropic 兼容端点 + 管理端点。
 
 use crate::auth::check_auth;
+use crate::cache::ResponseCache;
 use crate::config::Config;
 use crate::errors::{AppError, AppResult};
+use crate::features;
+use crate::ledger::{self, Ledger, UsageRecord};
 use crate::models::{self, DEFAULT_MODEL};
 use crate::protocol::anthropic::{self as anth};
 use crate::protocol::openai::{self as oai};
+use crate::replay::ReplayStore;
 use crate::session::SessionStore;
 use crate::upstream::UpstreamClient;
 use axum::extract::{Request, State};
@@ -24,6 +28,12 @@ pub struct AppState {
     pub cfg: Config,
     pub upstream: Arc<UpstreamClient>,
     pub sessions: SessionStore,
+    /// 请求级响应缓存
+    pub cache: ResponseCache,
+    /// 用量账本（SQLite）
+    pub ledger: Ledger,
+    /// 断线重放缓冲
+    pub replay: ReplayStore,
 }
 
 pub type SharedState = Arc<AppState>;
@@ -50,6 +60,9 @@ pub fn build_router(state: SharedState) -> Router {
 
     let mut router = Router::new()
         .route("/healthz", get(healthz))
+        // 控制台（自校验 admin_enabled/admin_token）
+        .route("/admin", get(crate::admin::admin_page))
+        .route("/admin/api/status", get(crate::admin::admin_status))
         .merge(api)
         .with_state(state.clone());
 
@@ -170,13 +183,19 @@ async fn openai_chat(
     Json(req): Json<oai::ChatRequest>,
 ) -> AppResult<Response> {
     check_auth(&state.cfg, &headers)?;
+    let t0 = Instant::now();
+    let key_id = ledger::key_id(&headers);
     let model_id = req
         .model
         .clone()
         .unwrap_or_else(|| DEFAULT_MODEL.to_string());
     let meta = models::resolve_model(&model_id, &state.cfg.default_model);
-    let prompt = oai::messages_to_prompt(&req)?;
+    let raw_prompt = oai::messages_to_prompt(&req)?;
+    // P3-6：语言/风格指令注入
+    let prompt = features::inject_system_prompt(&raw_prompt, &state.cfg.system_prompt_suffix);
     let stream = req.stream.unwrap_or(false);
+    // P3-7：伪工具说明注入（仅当启用且非流式时提示模型可调用）
+    let cache_key = ResponseCache::key(&model_id, &prompt);
 
     let session_key = req.user.clone().or_else(|| {
         headers
@@ -184,7 +203,30 @@ async fn openai_chat(
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string())
     });
+    // 缓存仅在"无会话历史"（纯单轮）时启用，避免与上游多轮上下文语义冲突
+    let cacheable = session_key.is_none();
     let (_sid, conv_uuid) = state.sessions.get_or_create(session_key.as_deref());
+
+    // P3-2：缓存命中（仅非流式 + 可缓存）
+    if !stream && cacheable {
+        if let Some(hit) = state.cache.get(cache_key) {
+            state
+                .ledger
+                .record(UsageRecord {
+                    ts: now_secs(),
+                    model: model_id.clone(),
+                    key_id,
+                    prompt_tokens: estimate_tokens(&prompt),
+                    completion_tokens: estimate_tokens(&hit),
+                    latency_ms: t0.elapsed().as_millis() as u64,
+                    status: 200,
+                    stream: false,
+                    cached: true,
+                })
+                .await;
+            return Ok(Json(chat_completion(&model_id, hit, &prompt)).into_response());
+        }
+    }
 
     // 确保认证
     state.upstream.ensure_authed().await?;
@@ -192,42 +234,62 @@ async fn openai_chat(
     if stream {
         let (events, id) = start_stream(&state, &prompt, &conv_uuid, &model_id, &meta).await?;
         let model = model_id.clone();
-        // 首个 chunk 声明 role（对齐 OpenAI 流规范）
         let id_head = id.clone();
         let model_head = model.clone();
-        let head = futures::stream::once(async move {
-            let fc = oai::first_chunk(&id_head, &model_head);
-            Ok::<_, Infallible>(Event::default().data(serde_json::to_string(&fc).unwrap()))
+        // P3-5：断线重放缓冲
+        let replay = state.replay.clone();
+        let rid = id.clone();
+        let head = futures::stream::once({
+            let replay = replay.clone();
+            let rid = rid.clone();
+            async move {
+                let fc = oai::first_chunk(&id_head, &model_head);
+                let data = serde_json::to_string(&fc).unwrap();
+                let seq = replay.push(&rid, format!("data: {data}"));
+                Ok::<_, Infallible>(Event::default().id(seq.to_string()).data(data))
+            }
         });
+        let replay_body = replay.clone();
+        let rid_body = rid.clone();
         let out = head
             .chain(events.map(move |item| -> Result<Event, Infallible> {
                 let ev = match item {
                     Ok(t) => t,
                     Err(e) => oai::Translated::Error(e.to_string()),
                 };
-                match ev {
-                    oai::Translated::Delta(text) => {
-                        let chunk = oai::content_chunk(&id, &model, &text);
-                        Ok(Event::default().data(serde_json::to_string(&chunk).unwrap()))
-                    }
-                    oai::Translated::Done => {
-                        let stop = oai::stop_chunk(&id, &model);
-                        Ok(Event::default().data(serde_json::to_string(&stop).unwrap()))
-                    }
-                    oai::Translated::Error(e) => {
-                        let err =
-                            serde_json::json!({"error":{"message":e,"type":"upstream_error"}});
-                        Ok(Event::default().data(serde_json::to_string(&err).unwrap()))
-                    }
-                    oai::Translated::Quota(m) => {
-                        let err =
-                            serde_json::json!({"error":{"message":m,"type":"rate_limit_error"}});
-                        Ok(Event::default().data(serde_json::to_string(&err).unwrap()))
-                    }
+                let (data, is_done) = match ev {
+                    oai::Translated::Delta(text) => (
+                        serde_json::to_string(&oai::content_chunk(&id, &model, &text)).unwrap(),
+                        false,
+                    ),
+                    oai::Translated::Done => (
+                        serde_json::to_string(&oai::stop_chunk(&id, &model)).unwrap(),
+                        true,
+                    ),
+                    oai::Translated::Error(e) => (
+                        serde_json::json!({"error":{"message":e,"type":"upstream_error"}})
+                            .to_string(),
+                        false,
+                    ),
+                    oai::Translated::Quota(m) => (
+                        serde_json::json!({"error":{"message":m,"type":"rate_limit_error"}})
+                            .to_string(),
+                        false,
+                    ),
+                };
+                let seq = replay_body.push(&rid_body, format!("data: {data}"));
+                if is_done {
+                    replay_body.finish(&rid_body);
                 }
+                Ok(Event::default().id(seq.to_string()).data(data))
             }))
-            .chain(futures::stream::once(async {
-                Ok(Event::default().data("[DONE]"))
+            .chain(futures::stream::once({
+                let replay = replay.clone();
+                let rid = rid.clone();
+                async move {
+                    replay.finish(&rid);
+                    Ok(Event::default().data("[DONE]"))
+                }
             }));
         return Ok(Sse::new(out).into_response());
     }
@@ -237,7 +299,13 @@ async fn openai_chat(
     let mut full = String::new();
     while let Some(item) = events.next().await {
         match item {
-            Ok(oai::Translated::Delta(t)) => full.push_str(&t),
+            Ok(oai::Translated::Delta(t)) => {
+                // P2：非流式输出上限保护
+                if full.len() + t.len() > state.cfg.max_response_bytes {
+                    return Err(AppError::Upstream("响应体超过上限".into()));
+                }
+                full.push_str(&t);
+            }
             Ok(oai::Translated::Done) => break,
             Ok(oai::Translated::Error(e)) => {
                 if e == "__TS_REQUIRED__" {
@@ -249,22 +317,52 @@ async fn openai_chat(
             Err(e) => return Err(e),
         }
     }
-    // usage 粗略估算（CJK 感知）
+    // P3-7：解析伪工具调用 → 本地执行 → 追加结果文本
+    let parsed = features::parse_tool_calls(&full);
+    let final_text = if parsed.calls.is_empty() {
+        full.clone()
+    } else {
+        let mut t = parsed.text.clone();
+        t.push_str("\n\n");
+        for call in &parsed.calls {
+            let r = features::execute_tool(call);
+            t.push_str(&format!("[tool:{}] {}\n", call.name, r));
+        }
+        t.trim().to_string()
+    };
+
+    // P3-2：写入缓存
+    if cacheable {
+        state.cache.put(cache_key, final_text.clone());
+    }
+
     let pt = estimate_tokens(&prompt);
-    let ct = estimate_tokens(&full);
-    let completion = oai::ChatCompletion {
+    let ct = estimate_tokens(&final_text);
+    // P3-3：账本
+    state
+        .ledger
+        .record(UsageRecord {
+            ts: now_secs(),
+            model: model_id.clone(),
+            key_id,
+            prompt_tokens: pt,
+            completion_tokens: ct,
+            latency_ms: t0.elapsed().as_millis() as u64,
+            status: 200,
+            stream: false,
+            cached: false,
+        })
+        .await;
+    Ok(Json(oai::ChatCompletion {
         id,
         object: "chat.completion".into(),
-        created: std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0),
+        created: now_secs(),
         model: model_id,
         choices: vec![oai::CompletionChoice {
             index: 0,
             message: oai::AssistantMessage {
                 role: "assistant".into(),
-                content: full,
+                content: final_text,
             },
             finish_reason: "stop".into(),
         }],
@@ -273,8 +371,39 @@ async fn openai_chat(
             completion_tokens: ct,
             total_tokens: pt + ct,
         },
-    };
-    Ok(Json(completion).into_response())
+    })
+    .into_response())
+}
+
+fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+fn chat_completion(model: &str, content: String, prompt: &str) -> oai::ChatCompletion {
+    let pt = estimate_tokens(prompt);
+    let ct = estimate_tokens(&content);
+    oai::ChatCompletion {
+        id: format!("chatcmpl-{}", uuid::Uuid::new_v4().simple()),
+        object: "chat.completion".into(),
+        created: now_secs(),
+        model: model.to_string(),
+        choices: vec![oai::CompletionChoice {
+            index: 0,
+            message: oai::AssistantMessage {
+                role: "assistant".into(),
+                content,
+            },
+            finish_reason: "stop".into(),
+        }],
+        usage: oai::Usage {
+            prompt_tokens: pt,
+            completion_tokens: ct,
+            total_tokens: pt + ct,
+        },
+    }
 }
 
 /// 翻译后的事件流类型别名。

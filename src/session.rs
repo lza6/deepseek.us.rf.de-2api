@@ -87,12 +87,11 @@ impl SessionStore {
         }
     }
 
-    #[cfg(test)]
+    /// 当前会话数（控制台/测试）。
     pub fn len(&self) -> usize {
         self.inner.lock().unwrap().len()
     }
 
-    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.inner.lock().unwrap().is_empty()
     }

@@ -14,7 +14,7 @@
 
 use crate::config::Config;
 use crate::errors::{AppError, AppResult};
-use crate::solver::{urlencode, SolverClient};
+use crate::solver::{urlencode, SolverPool};
 use futures::StreamExt;
 use serde::Deserialize;
 use std::sync::Arc;
@@ -25,7 +25,7 @@ use tokio::sync::Mutex;
 pub struct UpstreamClient {
     cfg: Config,
     http: reqwest::Client,
-    solver: Arc<SolverClient>,
+    solver: Arc<SolverPool>,
     /// 缓存的安全 cookie 状态
     state: Mutex<AuthState>,
     /// 认证串行化锁：确保同一时刻只有一个求解在途。
@@ -77,7 +77,7 @@ impl UpstreamClient {
         let http = builder
             .build()
             .map_err(|e| AppError::Internal(format!("HTTP 客户端构建失败: {e}")))?;
-        let solver = Arc::new(SolverClient::new(&cfg)?);
+        let solver = Arc::new(SolverPool::new(&cfg)?);
         Ok(UpstreamClient {
             state: Mutex::new(AuthState {
                 bot_id: cfg.bot_id.clone(),
@@ -93,6 +93,30 @@ impl UpstreamClient {
 
     pub fn config(&self) -> &Config {
         &self.cfg
+    }
+
+    /// 求解器健康快照（供控制台）。
+    pub fn solver_health(&self) -> Vec<serde_json::Value> {
+        self.solver.health_snapshot()
+    }
+
+    /// 求解器实例数量。
+    pub fn solver_count(&self) -> usize {
+        self.solver.len()
+    }
+
+    /// 当前是否持有有效认证（供控制台；不触发求解）。
+    pub fn is_authed_cached(&self) -> bool {
+        match self.state.try_lock() {
+            Ok(st) => {
+                Self::has_ok_cookie(&st)
+                    && st
+                        .cookie_obtained
+                        .map(|t| t.elapsed() < Duration::from_secs(self.cfg.cookie_ttl_secs))
+                        .unwrap_or(false)
+            }
+            Err(_) => false,
+        }
     }
 
     fn ajax_url(&self) -> String {

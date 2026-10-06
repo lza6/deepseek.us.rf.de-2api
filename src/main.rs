@@ -1,7 +1,10 @@
 //! deepseek-es-2api 入口。
 
 use deepseek_es_2api::api::{build_router, AppState, SharedState, SESSION_TTL_SECS};
+use deepseek_es_2api::cache::ResponseCache;
 use deepseek_es_2api::config::Config;
+use deepseek_es_2api::ledger::Ledger;
+use deepseek_es_2api::replay::ReplayStore;
 use deepseek_es_2api::session::SessionStore;
 use deepseek_es_2api::upstream::UpstreamClient;
 use std::path::PathBuf;
@@ -52,10 +55,32 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let upstream = Arc::new(UpstreamClient::new(cfg.clone())?);
+    let ledger = Ledger::open(&cfg.ledger_path)?;
+    if ledger.enabled() {
+        tracing::info!("用量账本已启用: {}", cfg.ledger_path);
+    }
+    let cache = ResponseCache::new(
+        cfg.cache_ttl_secs,
+        cfg.cache_max_entries,
+        cfg.cache_min_chars,
+    );
+    if cache.enabled() {
+        tracing::info!("响应缓存已启用: TTL {}s", cfg.cache_ttl_secs);
+    }
+    if cfg.admin_enabled {
+        if cfg.admin_token.is_empty() {
+            tracing::warn!("admin_enabled=true 但 admin_token 为空：控制台将拒绝访问");
+        } else {
+            tracing::info!("控制台已启用: /admin");
+        }
+    }
     let state: SharedState = Arc::new(AppState {
         cfg: cfg.clone(),
         upstream,
         sessions: SessionStore::new(Duration::from_secs(SESSION_TTL_SECS)),
+        cache,
+        ledger,
+        replay: ReplayStore::new(cfg.cache_ttl_secs.max(60), 1000, 10_000),
     });
 
     let app = build_router(state);

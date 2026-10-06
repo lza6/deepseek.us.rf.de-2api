@@ -2,6 +2,44 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/) 与 [语义化版本](https://semver.org/)。
 
+## [0.3.0] - 2026-10-06
+
+P3 增强全部落地：控制台、响应缓存、用量账本、多 solver 负载均衡、断线重放、语言注入、伪工具。
+
+### Added
+- **控制台 Web UI（P3-1）**：`/admin` 单页（自包含、无 CDN、深色编辑台风格）+ `/admin/api/status`。
+  展示模型、实时用量、solver 健康、最近请求、配置概览。默认关闭；需 `admin_enabled=true` + `admin_token`。
+  令牌校验用常量时间比较；未启用返回 404、令牌缺失/错误 401。
+- **请求级响应缓存（P3-2）**：`cache.rs`，LRU + TTL。仅对**无会话**请求启用（避免与上游按
+  `conversation_uuid` 维护的多轮上下文冲突）；命中不打上游。
+- **用量账本（P3-3）**：`ledger.rs`，SQLite（rusqlite bundled）持久化；`spawn_blocking` 写入不阻塞
+  运行时，失败仅告警不阻断请求。查询聚合统计与最近记录；`key_id` 脱敏（仅留前 6 位）。
+- **多 cf_solver 负载均衡（P3-4）**：`solver.rs` 改 `SolverPool`——轮询选取、跳过连续失败 ≥3 的实例、
+  单实例失败即故障转移到下一个；`health_snapshot()` 供控制台。
+- **断线重放（P3-5）**：`replay.rs`。为下游 SSE 事件编递增 `id:`，内存缓冲支持同进程内回放。
+  **限制如实披露**：上游不提供 `Last-Event-ID`（SSE 无 `id:` 行）且 `cache_key` 一次性，
+  故无法实现真正的上游续传。
+- **语言注入（P3-6）**：`features::inject_system_prompt`；`system_prompt_suffix` 追加 system 指令
+  （实测：向默认西语站点注入"Always answer in English"后，真实上游改为英文回复）。
+- **伪工具调用（P3-7）**：`features::parse_tool_calls` 提取 ` ```tool ` JSON 块，网关本地执行
+  （内置 `get_time`/`echo`）并把结果回填到回复。
+- 非流式聚合输出上限 `max_response_bytes`。
+
+### Changed
+- `AppState` 新增 `cache`/`ledger`/`replay` 字段；`build_router` 注册 `/admin` 路由。
+
+### Verified
+- `cargo test --all`：**73 单测 + 20 集成全绿**；fmt / clippy `-D warnings` 干净；doctest 通过。
+- **真实 E2E**（deepseek.es + cf_solver）：
+  - 控制台：正确令牌 200（6KB HTML）、错误令牌 401、未启用 404。
+  - 缓存：相同请求第二次命中（账本 `cache_hits=1`）。
+  - 账本：`total_requests=3`、`avg_latency_ms` 等正确；SQLite 文件持久化。
+  - solver 健康：`healthy=true`、`last_success_secs≈26.4`。
+  - **多 solver 故障转移**：配置 `["http://127.0.0.1:9999"(坏), "http://127.0.0.1:8001"(好)]`，
+    请求自动跳过坏实例、经好实例成功。
+  - **语言注入**：中文提问 + 英文指令 → 真实上游返回英文 `"Hello! How can I help you today?"`。
+  - **SSE id**：流式事件带递增 `id: 1..8` + `[DONE]`。
+
 ## [0.2.1] - 2026-10-06
 
 独立代码审计（v0.1.0..v0.2.0 全量 diff，结论 APPROVE/无 CRITICAL-HIGH）后修复 2 MEDIUM + 4 LOW。

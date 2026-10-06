@@ -52,6 +52,30 @@ fn default_max_concurrency() -> usize {
 fn default_rate_limit() -> u64 {
     0
 }
+fn default_false() -> bool {
+    false
+}
+fn default_cache_ttl() -> u64 {
+    300
+}
+fn default_cache_max() -> usize {
+    1000
+}
+fn default_admin_token() -> String {
+    String::new()
+}
+fn default_ledger_path() -> String {
+    "usage.db".into()
+}
+fn default_solvers() -> Vec<String> {
+    vec![]
+}
+fn default_language_prompt() -> String {
+    String::new()
+}
+fn default_cache_max_bytes() -> usize {
+    2 * 1024 * 1024
+}
 
 /// 顶层配置。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -110,6 +134,33 @@ pub struct Config {
     /// 每秒请求上限（0=不限）
     #[serde(default = "default_rate_limit")]
     pub rate_limit_per_sec: u64,
+    /// 控制台 Web UI 开关（`/admin`）
+    #[serde(default = "default_false")]
+    pub admin_enabled: bool,
+    /// 控制台访问令牌（空 = 未设置，控制台拒绝访问并提示）
+    #[serde(default = "default_admin_token")]
+    pub admin_token: String,
+    /// 请求级响应缓存：TTL 秒（0=关闭）
+    #[serde(default = "default_cache_ttl")]
+    pub cache_ttl_secs: u64,
+    /// 请求级响应缓存：最大条目数
+    #[serde(default = "default_cache_max")]
+    pub cache_max_entries: usize,
+    /// 请求级响应缓存：命中下限（prompt+回复 字符数，低于不缓存，避免噪声）
+    #[serde(default)]
+    pub cache_min_chars: usize,
+    /// 用量账本：SQLite 路径（空 = 关闭持久化）
+    #[serde(default = "default_ledger_path")]
+    pub ledger_path: String,
+    /// 多 cf_solver 实例（空 = 使用 `cf_solver_url` 单实例）
+    #[serde(default = "default_solvers")]
+    pub solver_urls: Vec<String>,
+    /// 提示词注入：追加到 system 的语言指令（空 = 不注入）
+    #[serde(default = "default_language_prompt")]
+    pub system_prompt_suffix: String,
+    /// 非流式聚合输出上限（字节；超限返回错误，防上游超大响应）
+    #[serde(default = "default_cache_max_bytes")]
+    pub max_response_bytes: usize,
 }
 
 impl Default for Config {
@@ -133,6 +184,15 @@ impl Default for Config {
             breaker_cooldown_secs: default_breaker_cooldown(),
             max_concurrency: default_max_concurrency(),
             rate_limit_per_sec: default_rate_limit(),
+            admin_enabled: false,
+            admin_token: default_admin_token(),
+            cache_ttl_secs: default_cache_ttl(),
+            cache_max_entries: default_cache_max(),
+            cache_min_chars: 0,
+            ledger_path: default_ledger_path(),
+            solver_urls: default_solvers(),
+            system_prompt_suffix: default_language_prompt(),
+            max_response_bytes: default_cache_max_bytes(),
         }
     }
 }

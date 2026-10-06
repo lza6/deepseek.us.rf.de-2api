@@ -87,6 +87,29 @@ claude
 | `/v1/messages/count_tokens` | POST | token 预估 |
 | `/v1/models` | GET | 模型列表 |
 | `/healthz` | GET | 健康检查 |
+| `/admin` | GET | 控制台 Web UI（需 `admin_enabled` + `admin_token`） |
+| `/admin/api/status` | GET | 控制台数据 JSON |
+
+### 控制台
+
+`admin_enabled=true` 且设置 `admin_token` 后访问 `http://127.0.0.1:47833/admin?token=<token>`
+（或 `X-Admin-Token` 头）。展示：模型列表、实时用量统计、solver 健康、最近请求、配置概览。
+自包含单页（无外部 CDN），仅本机建议开启。
+
+### 增强特性
+
+| 特性 | 配置 | 说明 |
+|------|------|------|
+| **请求级响应缓存** | `cache_ttl_secs` | 相同 prompt（**无会话语义**）短时复用，降低上游压力 |
+| **用量账本** | `ledger_path` | SQLite 持久化（`usage.db`）；空 = 关闭 |
+| **多 solver 负载均衡** | `solver_urls` | 轮询 + 健康探测 + 故障转移；空则用 `cf_solver_url` |
+| **语言注入** | `system_prompt_suffix` | 追加 system 指令（如"用用户语言回答"） |
+| **伪工具调用** | — | 模型输出 ` ```tool ` JSON 块 → 网关本地执行并回填 |
+| **断线重放** | — | SSE 事件带 `id:`；见下方限制说明 |
+
+> **断线重连限制（如实披露）**：上游 SSE **不发 `id:` 行**且 `cache_key` 一次性，
+> 故**无法**实现真正的 `Last-Event-ID` 续传。网关侧实现的是**缓冲重放**：为下游 SSE
+> 事件编递增 `id:` 并在内存保留缓冲，同进程内可部分回放；进程重启/缓冲过期后失效。
 
 ---
 
@@ -108,6 +131,15 @@ claude
 | `breaker_cooldown_secs` | `30` | 认证熔断：冷却秒数 |
 | `max_concurrency` | `0` | **全局**最大并发（0 = 不限）。注：仅在 handler 返回响应头前生效，不约束已建立的 SSE 流时长 |
 | `rate_limit_per_sec` | `0` | 端点每秒限流（0 = 不限，固定窗口，全局共享；位于鉴权之前，未鉴权请求同样计数） |
+| `admin_enabled` | `false` | 启用控制台 |
+| `admin_token` | `""` | 控制台访问令牌（启用时必填） |
+| `cache_ttl_secs` | `300` | 响应缓存 TTL（0 = 关闭） |
+| `cache_max_entries` | `1000` | 响应缓存最大条目 |
+| `cache_min_chars` | `0` | 低于该长度的结果不缓存 |
+| `ledger_path` | `usage.db` | SQLite 账本路径（空 = 关闭） |
+| `solver_urls` | `[]` | 多 cf_solver 地址（空则用 `cf_solver_url`） |
+| `system_prompt_suffix` | `""` | 追加的 system 指令（语言/风格） |
+| `max_response_bytes` | `2097152` | 非流式聚合上限（防超大响应） |
 
 环境变量可覆盖：`LISTEN_ADDR` `UPSTREAM_BASE_URL` `BOT_ID` `SITEKEY` `CF_SOLVER_URL` `API_KEYS` `PROXY` `DEFAULT_MODEL` `CORS_ALLOW_ORIGINS`
 

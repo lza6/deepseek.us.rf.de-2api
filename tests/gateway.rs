@@ -209,6 +209,23 @@ async fn spawn_mock_solver() -> String {
     format!("http://{}", addr)
 }
 
+/// 构造测试用 AppState（含新增的 cache/ledger/replay 字段）。
+fn make_state(cfg: deepseek_es_2api::Config) -> Arc<deepseek_es_2api::api::AppState> {
+    let client = Arc::new(deepseek_es_2api::UpstreamClient::new(cfg.clone()).unwrap());
+    Arc::new(deepseek_es_2api::api::AppState {
+        cfg: cfg.clone(),
+        upstream: client,
+        sessions: deepseek_es_2api::session::SessionStore::new(Duration::from_secs(60)),
+        cache: deepseek_es_2api::cache::ResponseCache::new(
+            cfg.cache_ttl_secs,
+            cfg.cache_max_entries,
+            cfg.cache_min_chars,
+        ),
+        ledger: deepseek_es_2api::ledger::Ledger::open(&cfg.ledger_path).unwrap(),
+        replay: deepseek_es_2api::replay::ReplayStore::new(60, 100, 1000),
+    })
+}
+
 async fn spawn_gateway() -> String {
     let upstream = spawn_mock_upstream().await;
     let solver = spawn_mock_solver().await;
@@ -219,12 +236,7 @@ async fn spawn_gateway() -> String {
         listen_addr: "127.0.0.1:0".into(),
         ..Default::default()
     };
-    let client = Arc::new(deepseek_es_2api::UpstreamClient::new(cfg.clone()).unwrap());
-    let state = Arc::new(deepseek_es_2api::api::AppState {
-        cfg,
-        upstream: client,
-        sessions: deepseek_es_2api::session::SessionStore::new(Duration::from_secs(60)),
-    });
+    let state = make_state(cfg);
     let app = deepseek_es_2api::api::build_router(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -395,12 +407,7 @@ async fn ts_required_triggers_reauth_and_retry() {
         listen_addr: "127.0.0.1:0".into(),
         ..Default::default()
     };
-    let client = Arc::new(deepseek_es_2api::UpstreamClient::new(cfg.clone()).unwrap());
-    let state = Arc::new(deepseek_es_2api::api::AppState {
-        cfg,
-        upstream: client,
-        sessions: deepseek_es_2api::session::SessionStore::new(Duration::from_secs(60)),
-    });
+    let state = make_state(cfg);
     let app = deepseek_es_2api::api::build_router(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -436,12 +443,7 @@ async fn auth_enforced_when_keys_configured() {
         api_keys: vec!["sk-secret".into()],
         ..Default::default()
     };
-    let client = Arc::new(deepseek_es_2api::UpstreamClient::new(cfg.clone()).unwrap());
-    let state = Arc::new(deepseek_es_2api::api::AppState {
-        cfg,
-        upstream: client,
-        sessions: deepseek_es_2api::session::SessionStore::new(Duration::from_secs(60)),
-    });
+    let state = make_state(cfg);
     let app = deepseek_es_2api::api::build_router(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -479,12 +481,7 @@ async fn serve_gateway(
         ..Default::default()
     };
     mutate(&mut cfg);
-    let client = Arc::new(deepseek_es_2api::UpstreamClient::new(cfg.clone()).unwrap());
-    let state = Arc::new(deepseek_es_2api::api::AppState {
-        cfg,
-        upstream: client,
-        sessions: deepseek_es_2api::session::SessionStore::new(Duration::from_secs(60)),
-    });
+    let state = make_state(cfg);
     let app = deepseek_es_2api::api::build_router(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -710,4 +707,276 @@ async fn models_single_routable() {
     assert_eq!(data[0]["id"], "deepseek-es");
     assert_eq!(data[0]["routable"], true);
     assert!(data[0]["alias_of"].is_null());
+}
+
+// ══ P3 增强功能集成测试 ═════════════════════════════════
+
+/// P3-2：响应缓存——相同无会话请求第二次不打上游。
+#[tokio::test]
+async fn response_cache_hits_on_repeat() {
+    let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let h = hits.clone();
+    let app = Router::new().route("/", get(mock_home)).route(
+        "/wp-admin/admin-ajax.php",
+        post(move |f: axum::extract::Form<Form>| {
+            let h = h.clone();
+            async move {
+                match f.action.as_str() {
+                    "deepseek_ts_verify" => {
+                        let mut hd = axum::http::HeaderMap::new();
+                        hd.insert("set-cookie", "dsts_ok=1; Path=/".parse().unwrap());
+                        (axum::http::StatusCode::OK, hd, r#"{"ok":true}"#.to_string())
+                    }
+                    "aipkit_get_frontend_chat_nonce" => (
+                        axum::http::StatusCode::OK,
+                        axum::http::HeaderMap::new(),
+                        r#"{"success":true,"data":{"nonce":"n"}}"#.to_string(),
+                    ),
+                    "aipkit_cache_sse_message" => {
+                        h.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        (
+                            axum::http::StatusCode::OK,
+                            axum::http::HeaderMap::new(),
+                            r#"{"success":true,"data":{"cache_key":"aipkit_sse_testkey"}}"#
+                                .to_string(),
+                        )
+                    }
+                    _ => (
+                        axum::http::StatusCode::OK,
+                        axum::http::HeaderMap::new(),
+                        r#"{"success":false}"#.to_string(),
+                    ),
+                }
+            }
+        })
+        .get(mock_sse),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let upstream = format!("http://{}", addr);
+    let solver = spawn_mock_solver().await;
+    let cfg = deepseek_es_2api::Config {
+        upstream_base_url: upstream,
+        cf_solver_url: solver,
+        solver_timeout_secs: 10,
+        cache_ttl_secs: 60,
+        ledger_path: String::new(),
+        ..Default::default()
+    };
+    let app = deepseek_es_2api::api::build_router(make_state(cfg));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let base = format!("http://{}", addr);
+    let client = reqwest::Client::new();
+    let body = serde_json::json!({
+        "model": "deepseek-es",
+        "messages": [{"role":"user","content":"cache me"}],
+        "stream": false
+    });
+    let r1 = client
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r1.status(), 200);
+    let after_first = hits.load(std::sync::atomic::Ordering::SeqCst);
+    let r2 = client
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r2.status(), 200);
+    let after_second = hits.load(std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(
+        after_first, after_second,
+        "第二次应命中缓存、不再打上游 (first={after_first} second={after_second})"
+    );
+    let v: serde_json::Value = r2.json().await.unwrap();
+    assert_eq!(v["choices"][0]["message"]["content"], "Hola mundo");
+}
+
+/// P3-1：控制台——未启用 404；启用后无/错令牌 401；正确令牌 200。
+#[tokio::test]
+async fn admin_console_auth() {
+    let base = spawn_gateway().await;
+    let r = reqwest::get(format!("{base}/admin")).await.unwrap();
+    assert_eq!(r.status(), 404, "未启用控制台应 404");
+
+    let upstream = spawn_mock_upstream().await;
+    let solver = spawn_mock_solver().await;
+    let cfg = deepseek_es_2api::Config {
+        upstream_base_url: upstream,
+        cf_solver_url: solver,
+        solver_timeout_secs: 10,
+        admin_enabled: true,
+        admin_token: "s3cret".into(),
+        ledger_path: String::new(),
+        ..Default::default()
+    };
+    let app = deepseek_es_2api::api::build_router(make_state(cfg));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let abase = format!("http://{}", addr);
+
+    assert_eq!(
+        reqwest::get(format!("{abase}/admin"))
+            .await
+            .unwrap()
+            .status(),
+        401
+    );
+    assert_eq!(
+        reqwest::get(format!("{abase}/admin?token=wrong"))
+            .await
+            .unwrap()
+            .status(),
+        401
+    );
+    let r = reqwest::get(format!("{abase}/admin?token=s3cret"))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    assert!(r.text().await.unwrap().contains("控制台"));
+    let r = reqwest::get(format!("{abase}/admin/api/status?token=s3cret"))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let v: serde_json::Value = r.json().await.unwrap();
+    assert!(v["models"].is_array());
+    assert_eq!(v["solver"].as_array().unwrap().len(), 1);
+}
+
+/// P3-3：账本——请求后统计可查。
+#[tokio::test]
+async fn ledger_records_usage() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("u.db");
+    let upstream = spawn_mock_upstream().await;
+    let solver = spawn_mock_solver().await;
+    let cfg = deepseek_es_2api::Config {
+        upstream_base_url: upstream,
+        cf_solver_url: solver,
+        solver_timeout_secs: 10,
+        ledger_path: path.to_str().unwrap().to_string(),
+        ..Default::default()
+    };
+    let state = make_state(cfg);
+    let ledger = state.ledger.clone();
+    let app = deepseek_es_2api::api::build_router(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let base = format!("http://{}", addr);
+    let r = reqwest::Client::new()
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&serde_json::json!({
+            "model":"deepseek-es",
+            "messages":[{"role":"user","content":"hi"}],
+            "stream": false
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let s = ledger.stats(None).await.unwrap();
+    assert_eq!(s.total_requests, 1, "应记录 1 条用量");
+    assert!(s.total_prompt_tokens > 0);
+}
+
+/// P3-7：伪工具——模型输出含 tool 块时，网关本地执行并回填。
+#[tokio::test]
+async fn pseudo_tool_executed() {
+    let app = Router::new()
+        .route("/", get(mock_home))
+        .route("/wp-admin/admin-ajax.php", post(mock_ajax).get(tool_sse));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let upstream = format!("http://{}", addr);
+    let solver = spawn_mock_solver().await;
+    let cfg = deepseek_es_2api::Config {
+        upstream_base_url: upstream,
+        cf_solver_url: solver,
+        solver_timeout_secs: 10,
+        ledger_path: String::new(),
+        ..Default::default()
+    };
+    let app = deepseek_es_2api::api::build_router(make_state(cfg));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let base = format!("http://{}", addr);
+    let v: serde_json::Value = reqwest::Client::new()
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&serde_json::json!({
+            "model":"deepseek-es",
+            "messages":[{"role":"user","content":"time?"}],
+            "stream": false
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let content = v["choices"][0]["message"]["content"].as_str().unwrap();
+    assert!(
+        content.contains("[tool:get_time]"),
+        "应回填工具执行结果: {content}"
+    );
+}
+
+/// P3-5：断线重放——网关为每个 SSE 事件带 id: 递增序号。
+#[tokio::test]
+async fn sse_events_have_ids() {
+    let base = spawn_gateway().await;
+    let body = reqwest::Client::new()
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&serde_json::json!({
+            "model":"deepseek-es",
+            "messages":[{"role":"user","content":"hi"}],
+            "stream": true
+        }))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(body.contains("id: 1"), "首事件应带 id: 1\n{body}");
+    assert!(body.contains("id: 2"), "次事件应带 id: 2\n{body}");
+}
+
+async fn tool_sse(
+    _q: axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    let delta = r#"{"delta":"check\n```tool\n{\"name\":\"get_time\",\"arguments\":{}}\n```"}"#;
+    let events = vec![
+        Ok::<_, Infallible>(
+            Event::default()
+                .event("message_start")
+                .data(r#"{"message_id":"m"}"#),
+        ),
+        Ok(Event::default().data(delta)),
+        Ok(Event::default().event("done").data(r#"{"finished":true}"#)),
+    ];
+    Sse::new(futures::stream::iter(events))
 }

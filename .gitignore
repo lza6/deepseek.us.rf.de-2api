@@ -13,3 +13,6 @@ __pycache__
 *.pyc
 dist
 RELEASE_NOTES.md
+
+# 用量账本
+usage.db*
