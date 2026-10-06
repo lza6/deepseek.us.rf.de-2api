@@ -12,7 +12,7 @@ use crate::protocol::openai::{self as oai};
 use crate::replay::ReplayStore;
 use crate::session::SessionStore;
 use crate::upstream::UpstreamClient;
-use axum::extract::{Request, State};
+use axum::extract::{Query, Request, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::middleware::Next;
 use axum::response::sse::{Event, Sse};
@@ -44,7 +44,9 @@ pub fn build_router(state: SharedState) -> Router {
         .route("/v1/models", get(list_models))
         .route("/v1/chat/completions", post(openai_chat))
         .route("/v1/messages", post(anthropic_messages))
-        .route("/v1/messages/count_tokens", post(count_tokens));
+        .route("/v1/messages/count_tokens", post(count_tokens))
+        // P3-5：断线重放（配合流式响应的 x-response-id）
+        .route("/v1/responses/{id}", get(replay_response));
 
     if state.cfg.rate_limit_per_sec > 0 {
         let rl = RateLimiter::new(state.cfg.rate_limit_per_sec);
@@ -251,6 +253,15 @@ async fn openai_chat(
         });
         let replay_body = replay.clone();
         let rid_body = rid.clone();
+        // P3-3：流式请求也需要入账（此前仅非流式被记录）
+        let ledger_s = state.ledger.clone();
+        let model_s = model.clone();
+        let key_s = key_id.clone();
+        let prompt_s = prompt.clone();
+        let t0_s = t0;
+        // 用 Arc<AtomicUsize> 在 map 闭包与末尾 once 之间共享完成字符数
+        let acc = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let acc_c = acc.clone();
         let out = head
             .chain(events.map(move |item| -> Result<Event, Infallible> {
                 let ev = match item {
@@ -258,10 +269,13 @@ async fn openai_chat(
                     Err(e) => oai::Translated::Error(e.to_string()),
                 };
                 let (data, is_done) = match ev {
-                    oai::Translated::Delta(text) => (
-                        serde_json::to_string(&oai::content_chunk(&id, &model, &text)).unwrap(),
-                        false,
-                    ),
+                    oai::Translated::Delta(text) => {
+                        acc_c.fetch_add(text.chars().count(), std::sync::atomic::Ordering::Relaxed);
+                        (
+                            serde_json::to_string(&oai::content_chunk(&id, &model, &text)).unwrap(),
+                            false,
+                        )
+                    }
                     oai::Translated::Done => (
                         serde_json::to_string(&oai::stop_chunk(&id, &model)).unwrap(),
                         true,
@@ -290,8 +304,31 @@ async fn openai_chat(
                     replay.finish(&rid);
                     Ok(Event::default().data("[DONE]"))
                 }
+            }))
+            .chain(futures::stream::once(async move {
+                // 流结束记账（异步、失败不阻断）
+                let chars = acc.load(std::sync::atomic::Ordering::Relaxed);
+                ledger_s
+                    .record(UsageRecord {
+                        ts: now_secs(),
+                        model: model_s,
+                        key_id: key_s,
+                        prompt_tokens: estimate_tokens(&prompt_s),
+                        completion_tokens: (chars / 2).max(1) as u32,
+                        latency_ms: t0_s.elapsed().as_millis() as u64,
+                        status: 200,
+                        stream: true,
+                        cached: false,
+                    })
+                    .await;
+                Ok::<_, Infallible>(Event::default().comment(""))
             }));
-        return Ok(Sse::new(out).into_response());
+        // 暴露响应 id，供客户端断线后调用 /v1/responses/<id> 重放
+        let mut resp = Sse::new(out).into_response();
+        if let Ok(v) = axum::http::HeaderValue::from_str(&rid) {
+            resp.headers_mut().insert("x-response-id", v);
+        }
+        return Ok(resp);
     }
 
     // 非流式：聚合
@@ -403,6 +440,56 @@ fn chat_completion(model: &str, content: String, prompt: &str) -> oai::ChatCompl
             completion_tokens: ct,
             total_tokens: pt + ct,
         },
+    }
+}
+
+// ── 断线重放（P3-5）─────────────────────────────────────
+
+/// `GET /v1/responses/{id}`：重放某次流式响应中、`Last-Event-ID` 之后的事件。
+///
+/// - 响应 id 来自流式响应的 `x-response-id` 头。
+/// - `Last-Event-ID` 头（或 `?after=`）指定已收到的最后一个序号。
+/// - 返回 `text/event-stream`，逐帧回放缓冲中的 SSE 数据。
+/// - 无此响应/已过期 → 409（提示客户端重新发起）。
+async fn replay_response(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Query(q): Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    if let Err(e) = check_auth(&state.cfg, &headers) {
+        return e.into_response();
+    }
+    let after = crate::replay::parse_last_event_id(&headers)
+        .or_else(|| q.get("after").and_then(|s| s.parse().ok()))
+        .unwrap_or(0);
+    match state.replay.replay(&id, after) {
+        Some(entries) => {
+            let frames: Vec<Result<Event, Infallible>> = entries
+                .into_iter()
+                .map(|e| {
+                    // e.frame 形如 "data: {...}"（可能带多行）；这里作为原始 data 回放
+                    let data = e
+                        .frame
+                        .strip_prefix("data: ")
+                        .unwrap_or(&e.frame)
+                        .to_string();
+                    Ok(Event::default().id(e.seq.to_string()).data(data))
+                })
+                .collect();
+            Sse::new(futures::stream::iter(frames)).into_response()
+        }
+        None => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": {
+                    "message": "响应不存在或重放缓冲已过期，请重新发起请求",
+                    "type": "invalid_request_error",
+                    "code": "replay_unavailable",
+                }
+            })),
+        )
+            .into_response(),
     }
 }
 
@@ -590,6 +677,27 @@ async fn anthropic_messages(
             }
             futures::stream::iter(evs)
         });
+        // P3-3：Anthropic 流式入账（流结束触发；token 用 prompt 估算 + 0 完成计数兜底）
+        let ledger_s = state.ledger.clone();
+        let model_s = model_id.clone();
+        let key_s = ledger::key_id(&headers);
+        let prompt_s = prompt.clone();
+        let out = out.chain(futures::stream::once(async move {
+            ledger_s
+                .record(UsageRecord {
+                    ts: now_secs(),
+                    model: model_s,
+                    key_id: key_s,
+                    prompt_tokens: estimate_tokens(&prompt_s),
+                    completion_tokens: 0,
+                    latency_ms: 0,
+                    status: 200,
+                    stream: true,
+                    cached: false,
+                })
+                .await;
+            Ok::<_, Infallible>(Event::default().comment(""))
+        }));
         return Ok(Sse::new(out).into_response());
     }
 
@@ -617,6 +725,21 @@ async fn anthropic_messages(
         "stop_sequence": null,
         "usage": {"input_tokens": estimate_tokens(&prompt), "output_tokens": estimate_tokens(&full)},
     });
+    // P3-3：Anthropic 非流式入账
+    state
+        .ledger
+        .record(UsageRecord {
+            ts: now_secs(),
+            model: model_id.clone(),
+            key_id: ledger::key_id(&headers),
+            prompt_tokens: estimate_tokens(&prompt),
+            completion_tokens: estimate_tokens(&full),
+            latency_ms: 0,
+            status: 200,
+            stream: false,
+            cached: false,
+        })
+        .await;
     Ok(Json(body).into_response())
 }
 

@@ -997,3 +997,138 @@ async fn tool_sse(
     ];
     Sse::new(futures::stream::iter(events))
 }
+
+// ══ 审计修复验证（重放可达 + 全路径入账）═════════════════
+
+/// HIGH：断线重放端点必须**可达**（此前 replay() 是死代码）。
+#[tokio::test]
+async fn replay_endpoint_is_reachable() {
+    let base = spawn_gateway().await;
+    // 发起一次流式请求，取 x-response-id
+    let resp = reqwest::Client::new()
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&serde_json::json!({
+            "model":"deepseek-es",
+            "messages":[{"role":"user","content":"hi"}],
+            "stream": true
+        }))
+        .send()
+        .await
+        .unwrap();
+    let rid = resp
+        .headers()
+        .get("x-response-id")
+        .expect("流式响应应带 x-response-id")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let body = resp.text().await.unwrap();
+    assert!(body.contains("id: 1"), "应带递增 id\n{body}");
+
+    // 用该 id 调重放端点：从头回放（after=0）
+    let r = reqwest::get(format!("{base}/v1/responses/{rid}?after=0"))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200, "重放端点应可达");
+    let rb = r.text().await.unwrap();
+    assert!(rb.contains("id: 1"), "应回放事件\n{rb}");
+
+    // 带 Last-Event-ID 头回放后半段
+    let r2 = reqwest::Client::new()
+        .get(format!("{base}/v1/responses/{rid}"))
+        .header("last-event-id", "1")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r2.status(), 200);
+    let rb2 = r2.text().await.unwrap();
+    assert!(!rb2.contains("id: 1\n"), "应跳过 seq<=1\n{rb2}");
+
+    // 未知 id → 409
+    let r3 = reqwest::get(format!("{base}/v1/responses/nonexistent-id?after=0"))
+        .await
+        .unwrap();
+    assert_eq!(r3.status(), 409, "未知响应应 409");
+}
+
+/// HIGH：流式请求也必须入账（此前仅非流式被记录）。
+#[tokio::test]
+async fn streaming_requests_are_recorded() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("s.db");
+    let upstream = spawn_mock_upstream().await;
+    let solver = spawn_mock_solver().await;
+    let cfg = deepseek_es_2api::Config {
+        upstream_base_url: upstream,
+        cf_solver_url: solver,
+        solver_timeout_secs: 10,
+        ledger_path: path.to_str().unwrap().to_string(),
+        ..Default::default()
+    };
+    let state = make_state(cfg);
+    let ledger = state.ledger.clone();
+    let app = deepseek_es_2api::api::build_router(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let base = format!("http://{}", addr);
+    let _ = reqwest::Client::new()
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&serde_json::json!({
+            "model":"deepseek-es",
+            "messages":[{"role":"user","content":"hi"}],
+            "stream": true
+        }))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let st = ledger.stats(None).await.unwrap();
+    assert_eq!(st.total_requests, 1, "流式请求应入账");
+}
+
+/// HIGH：Anthropic 请求也必须入账。
+#[tokio::test]
+async fn anthropic_requests_are_recorded() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a.db");
+    let upstream = spawn_mock_upstream().await;
+    let solver = spawn_mock_solver().await;
+    let cfg = deepseek_es_2api::Config {
+        upstream_base_url: upstream,
+        cf_solver_url: solver,
+        solver_timeout_secs: 10,
+        ledger_path: path.to_str().unwrap().to_string(),
+        ..Default::default()
+    };
+    let state = make_state(cfg);
+    let ledger = state.ledger.clone();
+    let app = deepseek_es_2api::api::build_router(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let base = format!("http://{}", addr);
+    let _ = reqwest::Client::new()
+        .post(format!("{base}/v1/messages"))
+        .json(&serde_json::json!({
+            "model":"deepseek-es",
+            "max_tokens": 50,
+            "messages":[{"role":"user","content":"hi"}]
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json::<serde_json::Value>()
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let st = ledger.stats(None).await.unwrap();
+    assert_eq!(st.total_requests, 1, "Anthropic 请求应入账");
+}

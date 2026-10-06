@@ -30,6 +30,8 @@ pub struct ReplayEntry {
 
 struct Buffer {
     entries: Vec<ReplayEntry>,
+    /// 已产出的事件总数（**单调递增**，不受 max_entries 截断影响）
+    next_seq: u64,
     updated: Instant,
     /// 是否已结束（收到 done）
     finished: bool,
@@ -69,10 +71,14 @@ impl ReplayStore {
         }
         let b = m.entry(resp_id.to_string()).or_insert_with(|| Buffer {
             entries: Vec::new(),
+            next_seq: 0,
             updated: Instant::now(),
             finished: false,
         });
-        let seq = b.entries.len() as u64 + 1;
+        // seq 取自独立计数器：即使超出 max_entries 被丢弃，序号仍**持续递增**
+        // （修复此前用 entries.len() 导致超限后 seq 钉死、破坏 SSE last-event-id 语义的缺陷）
+        let seq = b.next_seq + 1;
+        b.next_seq = seq;
         if b.entries.len() < self.max_entries_per_response {
             b.entries.push(ReplayEntry { seq, frame });
         }
@@ -191,6 +197,32 @@ mod tests {
         // 只保留前 3 条，但 seq 仍递增
         let r = s.replay("r", 0).unwrap();
         assert_eq!(r.len(), 3);
+    }
+
+    #[test]
+    fn seq_stays_monotonic_after_cap() {
+        // 回归：超出 max_entries 后 seq 必须持续递增（不得钉死在 cap+1）
+        let s = ReplayStore::new(60, 10, 3);
+        let mut last = 0;
+        for i in 0..10u64 {
+            let seq = s.push("r", format!("id: {i}"));
+            assert_eq!(seq, i + 1, "seq 必须单调递增");
+            assert!(seq > last);
+            last = seq;
+        }
+        assert_eq!(last, 10);
+    }
+
+    #[test]
+    fn replay_after_cap_has_gap_but_valid() {
+        // 超限丢弃的条目造成 gap，但回放起点仍有效（客户端据 last-event-id 判断）
+        let s = ReplayStore::new(60, 10, 2);
+        for i in 0..5 {
+            s.push("r", format!("id: {i}"));
+        }
+        let r = s.replay("r", 1).unwrap();
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].seq, 2);
     }
 
     #[test]

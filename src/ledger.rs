@@ -44,10 +44,23 @@ pub struct Ledger {
 
 impl Ledger {
     /// 打开账本。`path` 为空 → 内存模式（不持久化）。
+    ///
+    /// **账本是旁路观测，不是关键路径**：打开失败时降级为内存模式（记 warn），
+    /// **不**让网关启动失败（修复此前 open 失败会 fail-fast 阻断主服务的问题）。
     pub fn open(path: &str) -> AppResult<Self> {
         if path.trim().is_empty() {
             return Ok(Ledger { conn: None });
         }
+        match Self::try_open(path) {
+            Ok(l) => Ok(l),
+            Err(e) => {
+                tracing::warn!("用量账本打开失败，降级为内存模式（不持久化）: {e}");
+                Ok(Ledger { conn: None })
+            }
+        }
+    }
+
+    fn try_open(path: &str) -> AppResult<Self> {
         let conn = Connection::open(path)
             .map_err(|e| AppError::Internal(format!("打开用量账本失败: {e}")))?;
         // 多实例/并发打开同一账本时避免 "database is locked"：设置忙等待超时（5s）。
@@ -197,7 +210,10 @@ impl Ledger {
     }
 }
 
-/// 下游 key → 脱敏标识（保留前 6 位，避免账本泄露完整密钥）。
+/// 下游 key → 脱敏标识。
+///
+/// 仅保留前 4 位 + 末 2 位与长度，**避免暴露足够熵**去猜测完整密钥
+/// （此前保留前 6 位，熵偏高）。
 pub fn key_id(headers: &axum::http::HeaderMap) -> String {
     let raw = headers
         .get("x-api-key")
@@ -213,8 +229,17 @@ pub fn key_id(headers: &axum::http::HeaderMap) -> String {
     if raw.is_empty() {
         return "local".into();
     }
-    let prefix: String = raw.chars().take(6).collect();
-    format!("{prefix}…({})", raw.chars().count())
+    let chars: Vec<char> = raw.chars().collect();
+    let n = chars.len();
+    let id = if n <= 6 {
+        // 过短：只给长度，不给任何字符
+        "***".to_string()
+    } else {
+        let head: String = chars[..4].iter().collect();
+        let tail: String = chars[n - 2..].iter().collect();
+        format!("{head}**{tail}")
+    };
+    format!("{id}({n})")
 }
 
 #[cfg(test)]
@@ -251,7 +276,7 @@ mod tests {
             l.record(UsageRecord {
                 ts: 100 + i as i64,
                 model: "deepseek-es".into(),
-                key_id: "sk-abc…(10)".into(),
+                key_id: "sk-a**99(10)".into(),
                 prompt_tokens: 10,
                 completion_tokens: 5,
                 latency_ms: 100,
@@ -297,9 +322,26 @@ mod tests {
         let mut h = axum::http::HeaderMap::new();
         h.insert("x-api-key", "sk-supersecretvalue".parse().unwrap());
         let id = key_id(&h);
-        assert!(id.starts_with("sk-sup"));
-        assert!(!id.contains("secretvalue"));
-        assert!(id.contains("(19)"));
+        assert!(id.starts_with("sk-s"), "前 4 位: {id}");
+        assert!(id.contains("**"), "应含掩码: {id}");
+        assert!(id.contains("ue"), "末 2 位: {id}");
+        assert!(!id.contains("supersecret"), "不得泄露完整密钥: {id}");
+        assert!(id.contains("(19)"), "含长度: {id}");
         assert_eq!(key_id(&axum::http::HeaderMap::new()), "local");
+    }
+
+    #[test]
+    fn key_id_short_key_hides_all() {
+        let mut h = axum::http::HeaderMap::new();
+        h.insert("x-api-key", "short".parse().unwrap());
+        let id = key_id(&h);
+        assert_eq!(id, "***(5)", "过短密钥不得暴露任何字符: {id}");
+    }
+
+    #[tokio::test]
+    async fn open_failure_degrades_not_fatal() {
+        // 无效路径（目录不存在）→ 降级为内存模式，不返回 Err
+        let l = Ledger::open("/nonexistent-dir-xyz/sub/u.db").unwrap();
+        assert!(!l.enabled(), "打开失败应降级为内存模式");
     }
 }
