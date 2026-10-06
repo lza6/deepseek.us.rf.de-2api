@@ -1,0 +1,65 @@
+{
+  "probe": "p3-model",
+  "log": [
+    {
+      "prompt": "¿Qué modelo de IA eres? Responde en una frase.",
+      "sseStatus": 200,
+      "full": "Soy DeepSeek V4 Flash, un asistente de IA creado por DeepSeek (深度求索).",
+      "events": [
+        "__comment__",
+        "message_start",
+        "message",
+        "message",
+        "message",
+        "message",
+        "message",
+        "message",
+        "message",
+        "message",
+        "done"
+      ]
+    },
+    {
+      "prompt": "¿Cuál es tu versión? Responde en una frase.",
+      "sseStatus": 200,
+      "full": "Soy DeepSeek V4 Flash, una versión de modelo de lenguaje desarrollada por DeepSeek.",
+      "events": [
+        "__comment__",
+        "message_start",
+        "message",
+        "message",
+        "message",
+        "message",
+        "message",
+        "message",
+        "message",
+        "message",
+        "message",
+        "message",
+        "message",
+        "message",
+        "message",
+        "done"
+      ]
+    },
+    {
+      "prompt": "¿Quién te creó y cuál es tu nombre interno? Responde en una frase.",
+      "sseStatus": 200,
+      "full": "Fui creado por DeepSeek (深度求索) y mi nombre interno es DeepSeek V4 Flash.",
+      "events": [
+        "__comment__",
+        "message_start",
+        "message",
+        "message",
+        "message",
+        "message",
+        "message",
+        "message",
+        "message",
+        "message",
+        "message",
+        "done"
+      ]
+    }
+  ]
+}

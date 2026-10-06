@@ -1,0 +1,16 @@
+{
+  "listen_addr": "127.0.0.1:47833",
+  "upstream_base_url": "https://deepseek.es",
+  "bot_id": "27623",
+  "sitekey": "0x4AAAAAADlLZ3ljqZP6cQwq",
+  "cf_solver_url": "http://127.0.0.1:8001",
+  "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36",
+  "default_model": "deepseek-es",
+  "api_keys": [],
+  "proxy": null,
+  "solver_timeout_secs": 120,
+  "http_timeout_secs": 120,
+  "cookie_ttl_secs": 1800,
+  "pseudo_chunk_chars": 0,
+  "cors_allow_origins": []
+}

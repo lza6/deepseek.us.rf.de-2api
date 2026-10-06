@@ -1,0 +1,67 @@
+{
+  "probe": "p2-context",
+  "log": [
+    {
+      "label": "T1 建立上下文",
+      "prompt": "Me llamo ZhangSan. Recuérdalo.",
+      "sessionId": "f761c00d-4d84-4582-8e49-c73cfd3eb22a",
+      "conversationUuid": "f761c00d-4d84-4582-8e49-c73cfd3eb22a",
+      "sseStatus": 200,
+      "full": "¡Hola, ZhangSan! Encantado de conocerte. Recordaré tu nombre. ¿En qué puedo ayudarte hoy?",
+      "events": [
+        "__comment__",
+        "message_start",
+        "message",
+        "message",
+        "message",
+        "message",
+        "message",
+        "message",
+        "message",
+        "message",
+        "message",
+        "message",
+        "message",
+        "message",
+        "message",
+        "done"
+      ]
+    },
+    {
+      "label": "T2 同会话追问",
+      "prompt": "¿Cómo me llamo? Responde solo el nombre.",
+      "sessionId": "f761c00d-4d84-4582-8e49-c73cfd3eb22a",
+      "conversationUuid": "f761c00d-4d84-4582-8e49-c73cfd3eb22a",
+      "sseStatus": 200,
+      "full": "ZhangSan",
+      "events": [
+        "__comment__",
+        "message_start",
+        "message",
+        "message",
+        "message",
+        "message",
+        "done"
+      ]
+    },
+    {
+      "label": "T3 新会话对照",
+      "prompt": "¿Cómo me llamo? Responde solo el nombre.",
+      "sessionId": "79d0e20b-021f-4a13-94b9-cea7da8fcb31",
+      "conversationUuid": "79d0e20b-021f-4a13-94b9-cea7da8fcb31",
+      "sseStatus": 200,
+      "full": "No tengo esa información.",
+      "events": [
+        "__comment__",
+        "message_start",
+        "message",
+        "message",
+        "message",
+        "message",
+        "message",
+        "message",
+        "done"
+      ]
+    }
+  ]
+}

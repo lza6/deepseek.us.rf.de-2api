@@ -1,0 +1,3 @@
+
+var aipkit_chat_config_global = {"text":{"fullscreenError":"Error: Fullscreen functionality is unavailable.","copySuccess":"Copied!","copyFail":"Failed to copy","copyActionLabel":"Copy response","feedbackSubmitted":"Feedback submitted","feedbackError":"Error saving feedback","newChat":"New Chat","sidebarToggle":"Toggle Conversation Sidebar","historyGuests":"History unavailable for guests.","historyEmpty":"No past conversations.","playActionLabel":"Play audio","pauseActionLabel":"Pause audio","uploadFile":"Upload File (TXT, PDF)","fileContextActive":"Chatting with: %s","clearFileContext":"Clear file context"}};
+//# sourceURL=aipkit-public-main-js-extra

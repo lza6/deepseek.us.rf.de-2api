@@ -1,0 +1,80 @@
+
+(function () {
+    var AJAX_URL = "https:\/\/deepseek.es\/wp-admin\/admin-ajax.php";
+
+    function syncSidebar(container, wantOpen) {
+        var toggleBtn = container.querySelector('.aipkit_sidebar_toggle_btn');
+        if (!toggleBtn) return;
+        var isOpen = container.classList.contains('aipkit-sidebar-state-open');
+        if (wantOpen && !isOpen) {
+            toggleBtn.click();
+        } else if (!wantOpen && isOpen) {
+            toggleBtn.click();
+        }
+    }
+
+    function injectModelBadge(container) {
+        if (container.__dsbxModelBadge) return;
+        container.__dsbxModelBadge = true;
+        var botId = container.getAttribute('data-bot-id');
+        var info = container.querySelector('.aipkit_header_info');
+        if (!botId || !info) return;
+        fetch(AJAX_URL + '?action=dsbx_get_bot_model&bot_id=' + encodeURIComponent(botId), { credentials: 'same-origin' })
+            .then(function (r) { return r.json(); })
+            .then(function (j) {
+                if (!j || !j.success || !j.data || !j.data.label) return;
+                if (info.querySelector('.dsbx-model-badge')) return;
+                var badge = document.createElement('span');
+                badge.className = 'dsbx-model-badge';
+                badge.textContent = j.data.label;
+                info.appendChild(badge);
+            })
+            .catch(function () { /* noop */ });
+    }
+
+    function forceSidebarClosedOnPageLoad(container) {
+        // Bei Page-Load nie mit offener Sidebar starten — AIPKit hat sich den State
+        // aus dem Vollbild evtl. im localStorage gemerkt, was im kleinen Chat stört.
+        // Wir resetten Klasse + LocalStorage-Eintrag synchron.
+        if (container.classList.contains('aipkit-fullscreen')) return; // Vollbild aktiv: lassen
+        container.classList.remove('aipkit-sidebar-state-open');
+        container.classList.add('aipkit-sidebar-state-closed');
+        var botId = container.getAttribute('data-bot-id');
+        if (botId) {
+            try { localStorage.setItem('aipkit_sidebar_state_' + botId, 'closed'); } catch (e) {}
+        }
+    }
+
+    function attach(container) {
+        injectModelBadge(container);
+        if (container.__dsFullscreenSidebar) return;
+        container.__dsFullscreenSidebar = true;
+        // Initial-Reset auf closed, plus nach 100ms nochmal (falls AIPKit den State
+        // nach unserem Reset noch aus dem Storage zurückschreibt).
+        forceSidebarClosedOnPageLoad(container);
+        setTimeout(function () { forceSidebarClosedOnPageLoad(container); }, 100);
+        container.addEventListener('aipkit:fullscreenToggled', function (e) {
+            var fs = !!(e && e.detail && e.detail.isFullscreen);
+            // Plugin setzt die .aipkit-fullscreen-Klasse leicht zeitversetzt — warten.
+            setTimeout(function () { syncSidebar(container, fs); }, 50);
+        });
+    }
+
+    function init() {
+        document.querySelectorAll('.aipkit_chat_container').forEach(attach);
+    }
+
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', init);
+    } else {
+        init();
+    }
+    // Popups/Fullscreen-Container können nach DOMContentLoaded gerendert werden.
+    var tries = 0;
+    var poll = setInterval(function () {
+        tries++;
+        document.querySelectorAll('.aipkit_chat_container').forEach(attach);
+        if (tries > 30) clearInterval(poll);
+    }, 500);
+})();
+//# sourceURL=deepseek-chat-fullscreen-sidebar-js-after

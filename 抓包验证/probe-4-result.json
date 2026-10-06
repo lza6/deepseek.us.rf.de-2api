@@ -1,0 +1,110 @@
+{
+  "probe": "p4-sse-events",
+  "sseStatus": 200,
+  "contentType": "text/event-stream; charset=utf-8",
+  "bytes": 4391,
+  "nameCount": {
+    "__comment__": 1,
+    "message_start": 1,
+    "message": 7,
+    "done": 1
+  },
+  "eventSequence": [
+    "__comment__",
+    "message_start",
+    "message",
+    "message",
+    "message",
+    "message",
+    "message",
+    "message",
+    "message",
+    "done"
+  ],
+  "events": [
+    {
+      "event": "__comment__",
+      "data": ""
+    },
+    {
+      "event": "message_start",
+      "data": {
+        "message_id": "aipkit-msg-6ac46540b995c8.99869648"
+      }
+    },
+    {
+      "event": "message",
+      "data": {
+        "delta": ""
+      }
+    },
+    {
+      "event": "message",
+      "data": {
+        "delta": "Ro"
+      }
+    },
+    {
+      "event": "message",
+      "data": {
+        "delta": "jo"
+      }
+    },
+    {
+      "event": "message",
+      "data": {
+        "delta": "\nAzul\nVer"
+      }
+    },
+    {
+      "event": "message",
+      "data": {
+        "delta": "de\nA"
+      }
+    },
+    {
+      "event": "message",
+      "data": {
+        "delta": "marillo\nMorado"
+      }
+    },
+    {
+      "event": "message",
+      "data": {
+        "delta": ""
+      }
+    },
+    {
+      "event": "done",
+      "data": {
+        "finished": true
+      }
+    }
+  ],
+  "full": "Rojo\nAzul\nVerde\nAmarillo\nMorado",
+  "commentLines": 1,
+  "commentLooksWhitespace": true,
+  "responseHeaders": {
+    "access-control-allow-credentials": "true",
+    "access-control-allow-origin": "https://deepseek.es",
+    "alt-svc": "h3=\":443\"; ma=86400",
+    "cache-control": "no-cache, no-store, must-revalidate, max-age=0, no-transform",
+    "cf-cache-status": "DYNAMIC",
+    "cf-ray": "a46170716e85b16a-LAX",
+    "connection": "keep-alive",
+    "content-security-policy": "frame-ancestors 'self';",
+    "content-type": "text/event-stream; charset=utf-8",
+    "date": "Tue, 06 Oct 2026 03:04:32 GMT",
+    "expires": "Wed, 11 Jan 1984 05:00:00 GMT",
+    "nel": "{\"report_to\":\"cf-nel\",\"success_fraction\":0.0,\"max_age\":604800}",
+    "pragma": "no-cache",
+    "referrer-policy": "strict-origin-when-cross-origin",
+    "report-to": "{\"group\":\"cf-nel\",\"max_age\":604800,\"endpoints\":[{\"url\":\"https://a.nel.cloudflare.com/report/v4?s=LLs3d6gpIv%2BAHSiNw0%2FsGN%2B0A3LIkiCPpRykx40xYivVrbG9qQcP1RRV%2B37%2BrOI2CbfONDLlCoKfDfQ5XbYjoxd8r%2Bv9CrTE3caCa2Jbcx5VdAf6Iathm640zv2mgg%3D%3D\"}]}",
+    "server": "cloudflare",
+    "transfer-encoding": "chunked",
+    "x-content-type-options": "nosniff",
+    "x-frame-options": "SAMEORIGIN",
+    "x-powered-by": "PHP/8.3.35, PleskLin",
+    "x-robots-tag": "noindex"
+  }
+}

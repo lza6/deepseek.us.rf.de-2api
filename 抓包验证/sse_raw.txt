@@ -1,0 +1,26 @@
+:                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                
+
+event: message_start
+data: {"message_id":"aipkit-msg-6ac45e8eb8c5a6.44139757"}
+
+data: {"delta":""}
+
+data: {"delta":"¡"}
+
+data: {"delta":"Cl"}
+
+data: {"delta":"aro! Aquí va"}
+
+data: {"delta":":\n\n1..."}
+
+data: {"delta":" 2... 3..."}
+
+data: {"delta":" 🎉\n\n¿Ne"}
+
+data: {"delta":"cesitas algo más?"}
+
+data: {"delta":""}
+
+event: done
+data: {"finished":true}
+

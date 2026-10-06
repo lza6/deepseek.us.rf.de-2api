@@ -1,0 +1,13 @@
+/target
+/config.json
+*.log
+.env
+/tools/cf_solver/debug_logs
+/tools/cf_solver/__pycache__
+/tools/cf_solver/solver.log
+/抓包验证/cookies.txt
+/抓包验证/probe-cookies.json
+/抓包验证/evidence
+/抓包验证/solve-and-chat-result.json
+__pycache__
+*.pyc

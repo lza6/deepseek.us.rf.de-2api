@@ -1,0 +1,116 @@
+{
+  "probe": "p1-cookie-reuse",
+  "cookieAcquiredAt": "2026-10-06T02:59:23.694Z",
+  "total": 6,
+  "success": 6,
+  "log": [
+    {
+      "n": 1,
+      "atSec": 93,
+      "iso": "2026-10-06T02:59:25.858Z",
+      "sseStatus": 200,
+      "ct": "text/event-stream; charset=utf-8",
+      "cacheKey": "aipkit_sse_FsmfEPhOV4HECfQnfpm15nIPkPEmklPi",
+      "events": [
+        "__comment__",
+        "message_start",
+        "message",
+        "message",
+        "message",
+        "done"
+      ],
+      "full": "1",
+      "elapsed": 1120
+    },
+    {
+      "n": 2,
+      "atSec": 98,
+      "iso": "2026-10-06T02:59:31.776Z",
+      "sseStatus": 200,
+      "ct": "text/event-stream; charset=utf-8",
+      "cacheKey": "aipkit_sse_f7Cpvi5FIuOWXh4D5IiSLnJKhaY9vcEk",
+      "events": [
+        "__comment__",
+        "message_start",
+        "message",
+        "message",
+        "message",
+        "done"
+      ],
+      "full": "2",
+      "elapsed": 1882
+    },
+    {
+      "n": 3,
+      "atSec": 104,
+      "iso": "2026-10-06T02:59:37.110Z",
+      "sseStatus": 200,
+      "ct": "text/event-stream; charset=utf-8",
+      "cacheKey": "aipkit_sse_ENLoUomQgZyMJnY3FSlCfzBMslbMjmf0",
+      "events": [
+        "__comment__",
+        "message_start",
+        "message",
+        "message",
+        "message",
+        "done"
+      ],
+      "full": "3",
+      "elapsed": 1313
+    },
+    {
+      "n": 4,
+      "atSec": 110,
+      "iso": "2026-10-06T02:59:42.551Z",
+      "sseStatus": 200,
+      "ct": "text/event-stream; charset=utf-8",
+      "cacheKey": "aipkit_sse_kgQQzhbUI3UKVxY8w9vpoqwHGlIjfUAu",
+      "events": [
+        "__comment__",
+        "message_start",
+        "message",
+        "message",
+        "message",
+        "done"
+      ],
+      "full": "4",
+      "elapsed": 1440
+    },
+    {
+      "n": 5,
+      "atSec": 115,
+      "iso": "2026-10-06T02:59:48.262Z",
+      "sseStatus": 200,
+      "ct": "text/event-stream; charset=utf-8",
+      "cacheKey": "aipkit_sse_0H56jLuMMXIqRWLeiYh2Gjf6K46Lud8q",
+      "events": [
+        "__comment__",
+        "message_start",
+        "message",
+        "message",
+        "message",
+        "done"
+      ],
+      "full": "5",
+      "elapsed": 1706
+    },
+    {
+      "n": 6,
+      "atSec": 121,
+      "iso": "2026-10-06T02:59:53.954Z",
+      "sseStatus": 200,
+      "ct": "text/event-stream; charset=utf-8",
+      "cacheKey": "aipkit_sse_g1247V7zeY0o0e7CSDxhvW3T4Z4S1QNV",
+      "events": [
+        "__comment__",
+        "message_start",
+        "message",
+        "message",
+        "message",
+        "done"
+      ],
+      "full": "6",
+      "elapsed": 1402
+    }
+  ]
+}
