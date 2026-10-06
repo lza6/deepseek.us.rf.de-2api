@@ -4,30 +4,30 @@
 
 ## [0.3.1] - 2026-10-06
 
-独立审计（P3 新增模块）后修复 3 项——其中 2 项为"宣称有实现但实际不可达"的假实现，
-与项目"真实闭环"契约冲突，属必须修复。
+独立审计（P3 新增模块）后修复 5 项——其中 2 项为「宣称有实现但实际不可达」的假实现，
+与项目「真实闭环」契约冲突，属必须修复。
 
 ### Fixed
-- **HIGH · 断线重放不可达（假实现）**：/ 仅在
-   自身单测中被调用， 中**零生产调用点**——宣称的"断线重放"实际无法触发。
-  修复：新增  端点；流式响应返回  头；
-  客户端凭该 id + / 即可回放。未知/过期 id → 409。
-  新增集成测试  锁定可达性。
-- **HIGH · 用量漏记主路径**：账本仅在"非流式 OpenAI"与"缓存命中"处记录，
+- **HIGH · 断线重放不可达（假实现）**：`ReplayStore::replay()` / `parse_last_event_id()`
+  仅在 `replay.rs` 自身单测中被调用，`src/` 中**零生产调用点**——宣称的「断线重放」实际无法触发。
+  修复：新增 `GET /v1/responses/{id}` 端点；流式响应返回 `x-response-id` 头；
+  客户端凭该 id + `Last-Event-ID` / `?after=` 即可回放。未知/过期 id → 409。
+  新增集成测试 `replay_endpoint_is_reachable` 锁定可达性。
+- **HIGH · 用量漏记主路径**：账本仅在「非流式 OpenAI」与「缓存命中」处记录，
   **流式请求与全部 Anthropic 请求不入账**，控制台用量严重低估。
   修复：OpenAI 流式（流结束时记，含 completion token 估算）、Anthropic 流式与非流式
-  全部接入账本。新增测试 、。
-- **MEDIUM · 账本打开失败阻断主服务**： 失败会 fail-fast 让网关无法启动，
-  但账本是旁路观测组件。修复：降级为内存模式 + warn，不阻断（新增测试 ）。
-- **MEDIUM · 重放 seq 超限后钉死**： 在超过  后不再递增，
-  破坏 SSE  语义。改用独立单调计数器（测试 ）。
-- **LOW · 密钥脱敏不足**： 保留前 6 位，熵偏高。改为前 4 + 末 2 + 长度；
-  过短密钥不暴露任何字符（测试  / ）。
+  全部接入账本。新增测试 `streaming_requests_are_recorded`、`anthropic_requests_are_recorded`。
+- **MEDIUM · 账本打开失败阻断主服务**：`Ledger::open` 失败会 fail-fast 让网关无法启动，
+  但账本是旁路观测组件。修复：降级为内存模式 + warn，不阻断（测试 `open_failure_degrades_not_fatal`）。
+- **MEDIUM · 重放 seq 超限后钉死**：`seq = entries.len()+1` 在超过 `max_entries` 后不再递增，
+  破坏 SSE `last-event-id` 语义。改用独立单调计数器（测试 `seq_stays_monotonic_after_cap`）。
+- **LOW · 密钥脱敏不足**：`key_id` 保留前 6 位、熵偏高。改为前 4 + 末 2 + 长度；
+  过短密钥不暴露任何字符（测试 `key_id_masks_secret` / `key_id_short_key_hides_all`）。
 
 ### Verified
-- ：**77 单测 + 23 集成全绿**；fmt / clippy  干净。
-- **真实 E2E**：流式响应带 ； 真实回放 seq 3+
-  （8 个事件）；未知 id → 409；账本记录 ；
+- `cargo test --all`：**77 单测 + 23 集成全绿**；fmt / `clippy -D warnings` 干净。
+- **真实 E2E**：流式响应带 `x-response-id`；`GET /v1/responses/{id}?after=2` 真实回放 seq 3+
+  （8 个事件）；未知 id → 409；账本记录 `stream:true, prompt_tokens:4, completion_tokens:8`；
   Anthropic 请求入账（total 1→2）。
 
 ## [0.3.0] - 2026-10-06

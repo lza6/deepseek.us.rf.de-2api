@@ -89,6 +89,7 @@ claude
 | `/healthz` | GET | 健康检查 |
 | `/admin` | GET | 控制台 Web UI（需 `admin_enabled` + `admin_token`） |
 | `/admin/api/status` | GET | 控制台数据 JSON |
+| `/v1/responses/{id}` | GET | **断线重放**：回放某次流式响应未收到的事件 |
 
 ### 控制台
 
@@ -108,8 +109,10 @@ claude
 | **断线重放** | — | SSE 事件带 `id:`；见下方限制说明 |
 
 > **断线重连限制（如实披露）**：上游 SSE **不发 `id:` 行**且 `cache_key` 一次性，
-> 故**无法**实现真正的 `Last-Event-ID` 续传。网关侧实现的是**缓冲重放**：为下游 SSE
-> 事件编递增 `id:` 并在内存保留缓冲，同进程内可部分回放；进程重启/缓冲过期后失效。
+> 故**无法**实现真正的 `Last-Event-ID` 上游续传。网关侧实现的是**缓冲重放**：
+> 流式响应带 `x-response-id` 头，客户端断线后可 `GET /v1/responses/<id>` 并附
+> `Last-Event-ID`（或 `?after=N`）**在同进程内重新获取**未收到的事件；
+> 进程重启或缓冲过期（默认 TTL 300s）返回 409，需客户端重新发起。
 
 ---
 
