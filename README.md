@@ -106,8 +106,8 @@ claude
 | `solver_retries` | `2` | 求解失败重试次数（指数退避） |
 | `breaker_fail_threshold` | `5` | 认证熔断：连续失败阈值 |
 | `breaker_cooldown_secs` | `30` | 认证熔断：冷却秒数 |
-| `max_concurrency` | `0` | 端点最大并发（0 = 不限） |
-| `rate_limit_per_sec` | `0` | 端点每秒限流（0 = 不限） |
+| `max_concurrency` | `0` | **全局**最大并发（0 = 不限）。注：仅在 handler 返回响应头前生效，不约束已建立的 SSE 流时长 |
+| `rate_limit_per_sec` | `0` | 端点每秒限流（0 = 不限，固定窗口，全局共享；位于鉴权之前，未鉴权请求同样计数） |
 
 环境变量可覆盖：`LISTEN_ADDR` `UPSTREAM_BASE_URL` `BOT_ID` `SITEKEY` `CF_SOLVER_URL` `API_KEYS` `PROXY` `DEFAULT_MODEL` `CORS_ALLOW_ORIGINS`
 

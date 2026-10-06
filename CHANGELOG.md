@@ -2,6 +2,24 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/) 与 [语义化版本](https://semver.org/)。
 
+## [0.2.1] - 2026-10-06
+
+独立代码审计（v0.1.0..v0.2.0 全量 diff，结论 APPROVE/无 CRITICAL-HIGH）后修复 2 MEDIUM + 4 LOW。
+
+### Fixed
+- **并发限制语义**：`max_concurrency` 改用 `GlobalConcurrencyLimitLayer`（全局共享信号量）。原 `ConcurrencyLimitLayer` 是 per-route——4 个业务路由各持独立信号量，`max=4` 实际可放行 16，与「最大并发请求数」不符。
+- **退避溢出**：`solve_with_retry` 的 `1u64 << i` 在 `solver_retries >= 64` 时于 debug 构建触发 `attempt to shift left with overflow` panic。改为 `1u64 << i.min(3)`（先夹指数再移位）。
+- **熔断半开**：冷却到点进入半开时重置 `consecutive_failures`，避免失败计数无限累积与「冷却后一失败即重开」。
+- **死配置 `default_model`**：此前被解析但从不读取，现接线到 `resolve_model`（`DEFAULT_MODEL` 环境变量/配置真正生效）。
+- 清理 e2e 脚本中已删除的 `pseudo_chunk_chars` 字段。
+
+### Changed
+- README 澄清：`max_concurrency` 为**全局**且仅在 handler 返回响应头前生效（不约束已建立的 SSE 流时长）；`rate_limit_per_sec` 位于鉴权之前、无 per-client 维度。
+
+### Verified
+- `cargo test --all`：48 单测 + 15 集成全绿（新增 `default_model_override_takes_effect`）。
+- 实测：限流 `5/s` 突发 30 → `200×5 + 429×25`；`/healthz` 全豁免；并发 64 → 100% 成功；退避算法 `i<200` 无溢出。
+
 ## [0.2.0] - 2026-10-06
 
 ### Fixed

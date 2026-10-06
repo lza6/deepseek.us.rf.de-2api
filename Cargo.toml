@@ -1,6 +1,6 @@
 [package]
 name = "deepseek-es-2api"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 description = "deepseek.es 免费 AI 服务 → OpenAI/Anthropic 兼容 API 网关（Rust 版，Cloudflare Turnstile 求解）"
 authors = ["lza6"]

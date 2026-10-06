@@ -41,7 +41,9 @@ pub fn build_router(state: SharedState) -> Router {
         api = api.layer(axum::middleware::from_fn_with_state(rl, rate_limit_mw));
     }
     if state.cfg.max_concurrency > 0 {
-        api = api.layer(tower::limit::ConcurrencyLimitLayer::new(
+        // GlobalConcurrencyLimitLayer 在 clone 后共享同一 Semaphore，
+        // 保证跨路由的**全局**并发上限（ConcurrencyLimitLayer 是 per-route，会放大 N 倍）。
+        api = api.layer(tower::limit::GlobalConcurrencyLimitLayer::new(
             state.cfg.max_concurrency,
         ));
     }
@@ -172,7 +174,7 @@ async fn openai_chat(
         .model
         .clone()
         .unwrap_or_else(|| DEFAULT_MODEL.to_string());
-    let meta = models::resolve_model(&model_id);
+    let meta = models::resolve_model(&model_id, &state.cfg.default_model);
     let prompt = oai::messages_to_prompt(&req)?;
     let stream = req.stream.unwrap_or(false);
 
@@ -343,7 +345,7 @@ async fn anthropic_messages(
         .model
         .clone()
         .unwrap_or_else(|| DEFAULT_MODEL.to_string());
-    let meta = models::resolve_model(&model_id);
+    let meta = models::resolve_model(&model_id, &state.cfg.default_model);
     let prompt = anth::messages_to_prompt(&req).map_err(AppError::BadRequest)?;
     let stream = req.stream.unwrap_or(false);
 

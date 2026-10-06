@@ -229,7 +229,6 @@ async function main() {
     solver_timeout_secs: 120,
     http_timeout_secs: 120,
     cookie_ttl_secs: 1800,
-    pseudo_chunk_chars: 0,
     cors_allow_origins: [],
   }, null, 2));
 

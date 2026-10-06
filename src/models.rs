@@ -68,10 +68,14 @@ pub fn catalog() -> Vec<ModelMeta> {
 
 /// 解析下游请求的 `model` → 真实模型。
 ///
-/// 本站为单一模型：任何 id（含历史别名、provider 名、任意字符串）均回退到默认模型，
+/// 本站为单一模型：任何 id（含历史别名、provider 名、任意字符串）均回退到 `default_id`，
 /// 但会记录 debug 日志以便排查。响应中的 `model` 字段仍回显请求值（对齐 OpenAI 行为）。
-pub fn resolve_model(model: &str) -> ModelMeta {
-    let base = catalog().into_iter().next().expect("catalog 非空");
+pub fn resolve_model(model: &str, default_id: &str) -> ModelMeta {
+    let mut base = catalog().into_iter().next().expect("catalog 非空");
+    // 允许配置覆盖默认模型 id（default_model 配置项生效点）
+    if !default_id.trim().is_empty() && default_id.trim() != base.id {
+        base.id = default_id.trim().to_string();
+    }
     let m = model.trim();
     if !m.is_empty() && !m.eq_ignore_ascii_case(&base.id) && m.to_lowercase() != "default" {
         if LEGACY_ALIASES.iter().any(|a| a.eq_ignore_ascii_case(m)) {
@@ -102,24 +106,44 @@ mod tests {
 
     #[test]
     fn resolve_default() {
-        assert_eq!(resolve_model("").id, "deepseek-es");
-        assert_eq!(resolve_model("deepseek-es").id, "deepseek-es");
-        assert_eq!(resolve_model("  deepseek-es  ").id, "deepseek-es");
+        assert_eq!(resolve_model("", "deepseek-es").id, "deepseek-es");
+        assert_eq!(
+            resolve_model("deepseek-es", "deepseek-es").id,
+            "deepseek-es"
+        );
+        assert_eq!(
+            resolve_model("  deepseek-es  ", "deepseek-es").id,
+            "deepseek-es"
+        );
     }
 
     #[test]
     fn resolve_unknown_falls_back() {
-        assert_eq!(resolve_model("gpt-4o").id, "deepseek-es");
-        assert_eq!(resolve_model("deepseek-chat").id, "deepseek-es");
-        assert_eq!(resolve_model("openai").id, "deepseek-es");
-        assert_eq!(resolve_model("Claude").id, "deepseek-es");
+        assert_eq!(resolve_model("gpt-4o", "deepseek-es").id, "deepseek-es");
+        assert_eq!(
+            resolve_model("deepseek-chat", "deepseek-es").id,
+            "deepseek-es"
+        );
+        assert_eq!(resolve_model("openai", "deepseek-es").id, "deepseek-es");
+        assert_eq!(resolve_model("Claude", "deepseek-es").id, "deepseek-es");
     }
 
     #[test]
     fn legacy_aliases_still_accepted() {
         // 历史别名不再列出，但仍解析到默认模型（兼容旧客户端）
         for alias in LEGACY_ALIASES {
-            assert_eq!(resolve_model(alias).id, "deepseek-es", "alias={alias}");
+            assert_eq!(
+                resolve_model(alias, "deepseek-es").id,
+                "deepseek-es",
+                "alias={alias}"
+            );
         }
+    }
+
+    #[test]
+    fn default_model_override_takes_effect() {
+        // P2: default_model 配置项现真正生效
+        assert_eq!(resolve_model("", "custom-id").id, "custom-id");
+        assert_eq!(resolve_model("gpt-4o", "custom-id").id, "custom-id");
     }
 }

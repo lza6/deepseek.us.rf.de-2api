@@ -236,9 +236,19 @@ impl UpstreamClient {
     }
 
     /// 熔断是否放行（打开期间快速失败）。
+    ///
+    /// 冷却到点后进入「半开」：清空 `open_until`，使后续失败重新从 0 计数，
+    /// 避免冷却后一失败就立即再次打开、且失败计数无限累积。
     async fn breaker_allow(&self) -> bool {
-        let b = self.breaker.lock().await;
-        !matches!(b.open_until, Some(t) if Instant::now() < t)
+        let mut b = self.breaker.lock().await;
+        if let Some(t) = b.open_until {
+            if Instant::now() < t {
+                return false;
+            }
+            b.open_until = None;
+            b.consecutive_failures = 0;
+        }
+        true
     }
 
     async fn breaker_on_success(&self) {
@@ -267,7 +277,9 @@ impl UpstreamClient {
         let mut last_err = AppError::SolverFailed("求解失败".into());
         for i in 0..attempts {
             if i > 0 {
-                let backoff = Duration::from_secs((1u64 << i).min(8));
+                // 指数退避 2^i 秒，上限 8s。
+                // 先夹指数再移位，避免 solver_retries>=64 时 1u64<<i 在 debug 构建下溢出 panic。
+                let backoff = Duration::from_secs(1u64 << i.min(3));
                 tracing::warn!(
                     "Turnstile 求解重试 {}/{}（等待 {:?}）",
                     i + 1,
