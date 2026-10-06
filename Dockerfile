@@ -1,5 +1,5 @@
 # ===== 构建阶段 =====
-FROM rust:1.87-bookworm AS builder
+FROM rust:1.95-bookworm AS builder
 WORKDIR /build
 COPY Cargo.toml Cargo.lock* ./
 # 预热依赖缓存

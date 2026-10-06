@@ -5,7 +5,7 @@ edition = "2021"
 description = "deepseek.es 免费 AI 服务 → OpenAI/Anthropic 兼容 API 网关（Rust 版，Cloudflare Turnstile 求解）"
 authors = ["lza6"]
 license = "MIT"
-rust-version = "1.87"
+rust-version = "1.89"
 
 [[bin]]
 name = "deepseek-es-2api"
