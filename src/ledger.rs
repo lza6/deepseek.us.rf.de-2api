@@ -50,6 +50,9 @@ impl Ledger {
         }
         let conn = Connection::open(path)
             .map_err(|e| AppError::Internal(format!("打开用量账本失败: {e}")))?;
+        // 多实例/并发打开同一账本时避免 "database is locked"：设置忙等待超时（5s）。
+        conn.busy_timeout(std::time::Duration::from_secs(5))
+            .map_err(|e| AppError::Internal(format!("设置账本忙等待失败: {e}")))?;
         conn.execute_batch(
             "PRAGMA journal_mode=WAL;
              CREATE TABLE IF NOT EXISTS usage (

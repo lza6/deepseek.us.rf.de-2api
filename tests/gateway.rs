@@ -210,8 +210,25 @@ async fn spawn_mock_solver() -> String {
 }
 
 /// 构造测试用 AppState（含新增的 cache/ledger/replay 字段）。
+///
+/// 账本路径：测试间必须**隔离**——默认 `usage.db` 会让并行测试争抢同一文件
+/// （导致 "database is locked"）。此处强制改用进程内唯一临时文件。
 fn make_state(cfg: deepseek_es_2api::Config) -> Arc<deepseek_es_2api::api::AppState> {
     let client = Arc::new(deepseek_es_2api::UpstreamClient::new(cfg.clone()).unwrap());
+    let ledger_path = if cfg.ledger_path == "usage.db" {
+        // 未显式指定 → 用唯一临时路径，避免测试互相干扰
+        let p = std::env::temp_dir().join(format!(
+            "dses2api-test-{}-{:x}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        p.to_string_lossy().to_string()
+    } else {
+        cfg.ledger_path.clone()
+    };
     Arc::new(deepseek_es_2api::api::AppState {
         cfg: cfg.clone(),
         upstream: client,
@@ -221,7 +238,7 @@ fn make_state(cfg: deepseek_es_2api::Config) -> Arc<deepseek_es_2api::api::AppSt
             cfg.cache_max_entries,
             cfg.cache_min_chars,
         ),
-        ledger: deepseek_es_2api::ledger::Ledger::open(&cfg.ledger_path).unwrap(),
+        ledger: deepseek_es_2api::ledger::Ledger::open(&ledger_path).unwrap(),
         replay: deepseek_es_2api::replay::ReplayStore::new(60, 100, 1000),
     })
 }
