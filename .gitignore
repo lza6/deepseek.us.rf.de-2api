@@ -11,3 +11,5 @@
 /抓包验证/solve-and-chat-result.json
 __pycache__
 *.pyc
+dist
+RELEASE_NOTES.md
