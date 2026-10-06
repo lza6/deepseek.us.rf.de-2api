@@ -37,7 +37,19 @@ fn default_cookie_ttl() -> u64 {
     // 保守：上游 cookie 实际更长，30 分钟主动刷新
     1800
 }
-fn default_pseudo_chunk_chars() -> usize {
+fn default_solver_retries() -> u32 {
+    2
+}
+fn default_breaker_threshold() -> u32 {
+    5
+}
+fn default_breaker_cooldown() -> u64 {
+    30
+}
+fn default_max_concurrency() -> usize {
+    0
+}
+fn default_rate_limit() -> u64 {
     0
 }
 
@@ -80,12 +92,24 @@ pub struct Config {
     /// cookie 缓存 TTL（秒）
     #[serde(default = "default_cookie_ttl")]
     pub cookie_ttl_secs: u64,
-    /// 伪流式分块字符数（0=关闭；上游已原生流式，通常无需）
-    #[serde(default = "default_pseudo_chunk_chars")]
-    pub pseudo_chunk_chars: usize,
     /// CORS 允许来源；空 = 关闭
     #[serde(default)]
     pub cors_allow_origins: Vec<String>,
+    /// 求解失败重试次数（不含首次；0=不重试）
+    #[serde(default = "default_solver_retries")]
+    pub solver_retries: u32,
+    /// 认证熔断：连续失败阈值（达到后打开熔断）
+    #[serde(default = "default_breaker_threshold")]
+    pub breaker_fail_threshold: u32,
+    /// 认证熔断：打开后的冷却秒数（冷却后半开重试）
+    #[serde(default = "default_breaker_cooldown")]
+    pub breaker_cooldown_secs: u64,
+    /// 最大并发请求数（0=不限）
+    #[serde(default = "default_max_concurrency")]
+    pub max_concurrency: usize,
+    /// 每秒请求上限（0=不限）
+    #[serde(default = "default_rate_limit")]
+    pub rate_limit_per_sec: u64,
 }
 
 impl Default for Config {
@@ -103,8 +127,12 @@ impl Default for Config {
             solver_timeout_secs: default_solver_timeout(),
             http_timeout_secs: default_http_timeout(),
             cookie_ttl_secs: default_cookie_ttl(),
-            pseudo_chunk_chars: default_pseudo_chunk_chars(),
             cors_allow_origins: vec![],
+            solver_retries: default_solver_retries(),
+            breaker_fail_threshold: default_breaker_threshold(),
+            breaker_cooldown_secs: default_breaker_cooldown(),
+            max_concurrency: default_max_concurrency(),
+            rate_limit_per_sec: default_rate_limit(),
         }
     }
 }
@@ -194,6 +222,57 @@ impl Config {
             self.upstream_base_url.trim_end_matches('/')
         )
     }
+
+    /// 安全校验：非回环监听且未配置 api_keys 时拒绝启动（除非显式放开）。
+    ///
+    /// 背景：空 `api_keys` 的语义是"仅本机放行"（见 `auth.rs`）。
+    /// 若监听地址被改为 `0.0.0.0`（如 Dockerfile），该前提被破坏，
+    /// 网关会变成无鉴权的开放代理。这里 fail-fast 阻止误用。
+    ///
+    /// 逃生阀：环境变量 `ALLOW_INSECURE_PUBLIC=1`（仅供深知风险者）。
+    pub fn validate_security(&self) -> anyhow::Result<()> {
+        let allow_insecure = std::env::var("ALLOW_INSECURE_PUBLIC")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        self.validate_security_with(allow_insecure)
+    }
+
+    fn validate_security_with(&self, allow_insecure: bool) -> anyhow::Result<()> {
+        if allow_insecure || !self.api_keys.is_empty() {
+            return Ok(());
+        }
+        if host_is_loopback(&self.listen_addr) {
+            return Ok(());
+        }
+        anyhow::bail!(
+            "拒绝启动：监听地址 {} 非本机回环，但未配置 api_keys，网关将无鉴权暴露。\n\
+             请设置环境变量 API_KEYS（或 config.json 的 api_keys）；\n\
+             确需无鉴权暴露公网时，显式设置 ALLOW_INSECURE_PUBLIC=1（危险，不推荐）。",
+            self.listen_addr
+        )
+    }
+}
+
+/// 从 `host:port` 提取 host（兼容 `[::1]:port` 形式）。
+fn listen_host(addr: &str) -> &str {
+    if let Some(rest) = addr.strip_prefix('[') {
+        if let Some(end) = rest.find(']') {
+            return &rest[..end];
+        }
+    }
+    addr.rsplit_once(':').map(|(h, _)| h).unwrap_or(addr)
+}
+
+/// 判断监听地址是否为回环（`localhost` / 127.0.0.0/8 / ::1）。
+/// 无法解析的 host 一律视为非回环（保守拒绝）。
+fn host_is_loopback(addr: &str) -> bool {
+    let host = listen_host(addr);
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    host.parse::<std::net::IpAddr>()
+        .map(|ip| ip.is_loopback())
+        .unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -217,5 +296,66 @@ mod tests {
         c2.apply_env();
         assert_eq!(c2.bot_id, "99999");
         std::env::remove_var("BOT_ID");
+    }
+
+    #[test]
+    fn reject_public_bind_without_keys() {
+        // 0.0.0.0 + 空 keys → 拒绝启动
+        let c = Config {
+            listen_addr: "0.0.0.0:47833".into(),
+            api_keys: vec![],
+            ..Default::default()
+        };
+        assert!(c.validate_security_with(false).is_err());
+    }
+
+    #[test]
+    fn allow_public_bind_with_keys() {
+        // 0.0.0.0 + 有 keys → 放行
+        let c = Config {
+            listen_addr: "0.0.0.0:47833".into(),
+            api_keys: vec!["sk-x".into()],
+            ..Default::default()
+        };
+        assert!(c.validate_security_with(false).is_ok());
+    }
+
+    #[test]
+    fn allow_loopback_without_keys() {
+        // 回环 + 空 keys → 放行（本机语义）
+        for addr in ["127.0.0.1:47833", "localhost:47833", "[::1]:47833"] {
+            let c = Config {
+                listen_addr: addr.into(),
+                api_keys: vec![],
+                ..Default::default()
+            };
+            assert!(
+                c.validate_security_with(false).is_ok(),
+                "{addr} 应为回环放行"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_escape_hatch_allows_public() {
+        // 显式逃生阀：0.0.0.0 + 空 keys + allow_insecure → 放行
+        let c = Config {
+            listen_addr: "0.0.0.0:47833".into(),
+            api_keys: vec![],
+            ..Default::default()
+        };
+        assert!(c.validate_security_with(true).is_ok());
+    }
+
+    #[test]
+    fn loopback_detection_helper() {
+        assert!(host_is_loopback("127.0.0.1:1"));
+        assert!(host_is_loopback("127.5.5.5:1"));
+        assert!(host_is_loopback("localhost:1"));
+        assert!(host_is_loopback("[::1]:1"));
+        assert!(!host_is_loopback("0.0.0.0:1"));
+        assert!(!host_is_loopback("192.168.1.1:1"));
+        assert!(!host_is_loopback("example.com:1"));
+        assert!(!host_is_loopback(""));
     }
 }

@@ -103,19 +103,29 @@ claude
 | `proxy` | `null` | 上游出口代理（如 `http://127.0.0.1:10808`） |
 | `cookie_ttl_secs` | `1800` | 安全 cookie 缓存 TTL |
 | `cors_allow_origins` | `[]` | CORS；空 = 关闭 |
+| `solver_retries` | `2` | 求解失败重试次数（指数退避） |
+| `breaker_fail_threshold` | `5` | 认证熔断：连续失败阈值 |
+| `breaker_cooldown_secs` | `30` | 认证熔断：冷却秒数 |
+| `max_concurrency` | `0` | 端点最大并发（0 = 不限） |
+| `rate_limit_per_sec` | `0` | 端点每秒限流（0 = 不限） |
 
 环境变量可覆盖：`LISTEN_ADDR` `UPSTREAM_BASE_URL` `BOT_ID` `SITEKEY` `CF_SOLVER_URL` `API_KEYS` `PROXY` `DEFAULT_MODEL` `CORS_ALLOW_ORIGINS`
+
+> **安全**：监听地址为**非回环**（如 `0.0.0.0`）且 `api_keys` 为空时，网关**拒绝启动**（fail-fast）。确需无鉴权暴露公网须显式设置 `ALLOW_INSECURE_PUBLIC=1`（危险）。
 
 ---
 
 ## 模型
 
-上游前端不暴露真实模型 ID（由服务端 bot 配置决定），本网关暴露 **provider 级别名**：
+上游前端不暴露真实模型 ID（由服务端 bot 配置决定）。本站实测为**单一 bot**（`bot_id=27623`，`provider=DeepSeek`），代理**无法切换 provider**。
+
+因此本网关**只暴露一个真实模型**：
 
 | 模型 id | 说明 |
 |---------|------|
-| `deepseek-es` | 默认（上游 bot 配置的 provider=DeepSeek） |
-| `deepseek-es-openai` / `-claude` / `-google` / `-openrouter` / `-xai` | 按 provider 路由 |
+| `deepseek-es` | 唯一真实模型（`routable: true`） |
+
+> 历史别名（`deepseek-es-openai` / `-claude` / `-google` / `-openrouter` / `-xai`）仍被接受以兼容旧客户端，但**不再是独立模型**——会解析到 `deepseek-es`，且不再出现在 `/v1/models`。`/v1/models` 条目含 `routable` 与 `alias_of` 字段以如实标注。
 
 ---
 

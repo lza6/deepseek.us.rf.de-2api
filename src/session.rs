@@ -12,7 +12,12 @@ use std::time::{Duration, Instant};
 pub struct SessionStore {
     inner: Mutex<HashMap<String, SessionEntry>>,
     ttl: Duration,
+    /// 容量上限（超过后淘汰最久未活跃的一半，防无界增长）
+    max: usize,
 }
+
+/// 默认会话表容量上限。
+pub const MAX_SESSIONS: usize = 10_000;
 
 struct SessionEntry {
     conversation_uuid: String,
@@ -24,6 +29,16 @@ impl SessionStore {
         SessionStore {
             inner: Mutex::new(HashMap::new()),
             ttl,
+            max: MAX_SESSIONS,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_max(ttl: Duration, max: usize) -> Self {
+        SessionStore {
+            inner: Mutex::new(HashMap::new()),
+            ttl,
+            max,
         }
     }
 
@@ -39,6 +54,7 @@ impl SessionStore {
             e.last_active = Instant::now();
             return (key.to_string(), e.conversation_uuid.clone());
         }
+        self.enforce_capacity(&mut map);
         let conv = deterministic_uuid(key);
         map.insert(
             key.to_string(),
@@ -53,6 +69,22 @@ impl SessionStore {
     fn gc(&self, map: &mut HashMap<String, SessionEntry>) {
         let ttl = self.ttl;
         map.retain(|_, e| e.last_active.elapsed() < ttl);
+    }
+
+    /// 容量控制：达到上限时淘汰最久未活跃的一半条目。
+    fn enforce_capacity(&self, map: &mut HashMap<String, SessionEntry>) {
+        if map.len() < self.max {
+            return;
+        }
+        let mut entries: Vec<(String, Instant)> = map
+            .iter()
+            .map(|(k, e)| (k.clone(), e.last_active))
+            .collect();
+        entries.sort_by_key(|(_, t)| *t);
+        let drop_n = entries.len() / 2;
+        for (k, _) in entries.into_iter().take(drop_n) {
+            map.remove(&k);
+        }
     }
 
     #[cfg(test)]
@@ -125,5 +157,14 @@ mod tests {
         let u = deterministic_uuid("abc");
         assert_eq!(u.len(), 36);
         assert_eq!(u.chars().filter(|c| *c == '-').count(), 4);
+    }
+
+    #[test]
+    fn evicts_when_full() {
+        let s = SessionStore::with_max(Duration::from_secs(3600), 4);
+        for i in 0..20 {
+            s.get_or_create(Some(&format!("k{i}")));
+        }
+        assert!(s.len() <= 4, "容量未受限: len={}", s.len());
     }
 }

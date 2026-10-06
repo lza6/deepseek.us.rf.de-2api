@@ -33,6 +33,13 @@ async fn main() -> anyhow::Result<()> {
         });
 
     let cfg = Config::load(cfg_path.as_deref())?;
+
+    // 安全前置校验：非回环监听 + 空 api_keys → 拒绝启动（fail-fast）
+    if let Err(e) = cfg.validate_security() {
+        eprintln!("{e}");
+        std::process::exit(1);
+    }
+
     tracing::info!(
         "启动 deepseek-es-2api v{} | 监听 {} | 上游 {} | bot_id {}",
         env!("CARGO_PKG_VERSION"),
@@ -56,6 +63,29 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("控制面板/API: http://{}/", cfg.listen_addr);
     tracing::info!("OpenAI:    http://{}/v1", cfg.listen_addr);
     tracing::info!("Anthropic: http://{}/v1/messages", cfg.listen_addr);
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
     Ok(())
+}
+
+/// 等待 Ctrl-C（SIGINT）或 SIGTERM，触发优雅关闭（P2-13）。
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let term = async {
+        use tokio::signal::unix::{signal, SignalKind};
+        if let Ok(mut s) = signal(SignalKind::terminate()) {
+            s.recv().await;
+        }
+    };
+    #[cfg(not(unix))]
+    let term = std::future::pending::<()>();
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = term => {}
+    }
+    tracing::info!("收到关闭信号，优雅停止（等待在途请求完成）");
 }

@@ -8,8 +8,9 @@ use crate::protocol::anthropic::{self as anth};
 use crate::protocol::openai::{self as oai};
 use crate::session::SessionStore;
 use crate::upstream::UpstreamClient;
-use axum::extract::State;
-use axum::http::HeaderMap;
+use axum::extract::{Request, State};
+use axum::http::{HeaderMap, StatusCode};
+use axum::middleware::Next;
 use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -17,6 +18,7 @@ use axum::{Json, Router};
 use futures::StreamExt;
 use std::convert::Infallible;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 pub struct AppState {
     pub cfg: Config,
@@ -27,12 +29,26 @@ pub struct AppState {
 pub type SharedState = Arc<AppState>;
 
 pub fn build_router(state: SharedState) -> Router {
-    let mut router = Router::new()
-        .route("/healthz", get(healthz))
+    // 业务端点：限流/并发仅作用于 API，不拖累 /healthz 观测端点
+    let mut api = Router::new()
         .route("/v1/models", get(list_models))
         .route("/v1/chat/completions", post(openai_chat))
         .route("/v1/messages", post(anthropic_messages))
-        .route("/v1/messages/count_tokens", post(count_tokens))
+        .route("/v1/messages/count_tokens", post(count_tokens));
+
+    if state.cfg.rate_limit_per_sec > 0 {
+        let rl = RateLimiter::new(state.cfg.rate_limit_per_sec);
+        api = api.layer(axum::middleware::from_fn_with_state(rl, rate_limit_mw));
+    }
+    if state.cfg.max_concurrency > 0 {
+        api = api.layer(tower::limit::ConcurrencyLimitLayer::new(
+            state.cfg.max_concurrency,
+        ));
+    }
+
+    let mut router = Router::new()
+        .route("/healthz", get(healthz))
+        .merge(api)
         .with_state(state.clone());
 
     if !state.cfg.cors_allow_origins.is_empty() {
@@ -50,6 +66,54 @@ pub fn build_router(state: SharedState) -> Router {
         router = router.layer(cors);
     }
     router
+}
+
+/// 轻量固定窗口限流器（按秒计数）。
+#[derive(Clone)]
+struct RateLimiter {
+    per_sec: u64,
+    inner: Arc<std::sync::Mutex<(Instant, u64)>>,
+}
+
+impl RateLimiter {
+    fn new(per_sec: u64) -> Self {
+        RateLimiter {
+            per_sec,
+            inner: Arc::new(std::sync::Mutex::new((Instant::now(), 0))),
+        }
+    }
+
+    /// 是否放行（固定窗口：每满 1 秒重置计数）。
+    fn allow(&self) -> bool {
+        let mut g = self.inner.lock().unwrap();
+        let now = Instant::now();
+        if now.duration_since(g.0) >= Duration::from_secs(1) {
+            g.0 = now;
+            g.1 = 0;
+        }
+        if g.1 >= self.per_sec {
+            return false;
+        }
+        g.1 += 1;
+        true
+    }
+}
+
+async fn rate_limit_mw(State(rl): State<RateLimiter>, req: Request, next: Next) -> Response {
+    if !rl.allow() {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(serde_json::json!({
+                "error": {
+                    "message": "本机限流：请求过于频繁，请稍后重试",
+                    "type": "rate_limit_error",
+                    "code": "rate_limit_error",
+                }
+            })),
+        )
+            .into_response();
+    }
+    next.run(req).await
 }
 
 // ── 健康检查 ────────────────────────────────────────────
@@ -85,6 +149,8 @@ async fn list_models(
                 "context_window": m.context_window,
                 "provider": m.provider,
                 "default": m.default,
+                "routable": m.routable,
+                "alias_of": m.alias_of,
             })
         })
         .collect();
@@ -124,8 +190,15 @@ async fn openai_chat(
     if stream {
         let (events, id) = start_stream(&state, &prompt, &conv_uuid, &model_id, &meta).await?;
         let model = model_id.clone();
-        let out = events
-            .map(move |item| -> Result<Event, Infallible> {
+        // 首个 chunk 声明 role（对齐 OpenAI 流规范）
+        let id_head = id.clone();
+        let model_head = model.clone();
+        let head = futures::stream::once(async move {
+            let fc = oai::first_chunk(&id_head, &model_head);
+            Ok::<_, Infallible>(Event::default().data(serde_json::to_string(&fc).unwrap()))
+        });
+        let out = head
+            .chain(events.map(move |item| -> Result<Event, Infallible> {
                 let ev = match item {
                     Ok(t) => t,
                     Err(e) => oai::Translated::Error(e.to_string()),
@@ -144,8 +217,13 @@ async fn openai_chat(
                             serde_json::json!({"error":{"message":e,"type":"upstream_error"}});
                         Ok(Event::default().data(serde_json::to_string(&err).unwrap()))
                     }
+                    oai::Translated::Quota(m) => {
+                        let err =
+                            serde_json::json!({"error":{"message":m,"type":"rate_limit_error"}});
+                        Ok(Event::default().data(serde_json::to_string(&err).unwrap()))
+                    }
                 }
-            })
+            }))
             .chain(futures::stream::once(async {
                 Ok(Event::default().data("[DONE]"))
             }));
@@ -165,11 +243,13 @@ async fn openai_chat(
                 }
                 return Err(AppError::UpstreamStream(e));
             }
+            Ok(oai::Translated::Quota(m)) => return Err(AppError::QuotaExhausted(m)),
             Err(e) => return Err(e),
         }
     }
-    // usage 粗略估算（字符数/4）
-    let approx = (full.chars().count() as u32).div_ceil(4);
+    // usage 粗略估算（CJK 感知）
+    let pt = estimate_tokens(&prompt);
+    let ct = estimate_tokens(&full);
     let completion = oai::ChatCompletion {
         id,
         object: "chat.completion".into(),
@@ -187,25 +267,54 @@ async fn openai_chat(
             finish_reason: "stop".into(),
         }],
         usage: oai::Usage {
-            prompt_tokens: (prompt.chars().count() as u32).div_ceil(4),
-            completion_tokens: approx,
-            total_tokens: (prompt.chars().count() as u32).div_ceil(4) + approx,
+            prompt_tokens: pt,
+            completion_tokens: ct,
+            total_tokens: pt + ct,
         },
     };
     Ok(Json(completion).into_response())
 }
 
-/// 启动一次上游流：cache_message → stream_chat，返回翻译后的事件流。
+/// 翻译后的事件流类型别名。
+type TranslatedStream =
+    std::pin::Pin<Box<dyn futures::Stream<Item = AppResult<oai::Translated>> + Send>>;
+
+/// 启动一次上游流（cache_message → stream_chat），返回翻译后的事件流与响应 id。
+///
+/// `ts_required` 自愈：上游可能返回"安全校验失效"信号（首个事件即为
+/// `Translated::Error("__TS_REQUIRED__")`）。此时尚未向下游输出任何内容，
+/// 故可安全地强制重认证后**重试一次**。中途（已输出后）再遇该信号则不重试，
+/// 交由下游错误帧处理，避免重复输出。
 async fn start_stream(
     state: &SharedState,
     prompt: &str,
     conv_uuid: &str,
     _model_id: &str,
     _meta: &models::ModelMeta,
-) -> AppResult<(
-    std::pin::Pin<Box<dyn futures::Stream<Item = AppResult<oai::Translated>> + Send>>,
-    String,
-)> {
+) -> AppResult<(TranslatedStream, String)> {
+    let (mut stream, id) = start_stream_once(state, prompt, conv_uuid).await?;
+
+    // 探测首个事件，判断是否需要安全校验重试。
+    let first = stream.next().await;
+    if let Some(Ok(oai::Translated::Error(ref e))) = first {
+        if e == "__TS_REQUIRED__" {
+            tracing::warn!("上游要求重新安全校验，强制重认证后重试");
+            state.upstream.force_reauth().await?;
+            let (stream2, id2) = start_stream_once(state, prompt, conv_uuid).await?;
+            return Ok((stream2, id2));
+        }
+    }
+    // 无需重试：把已探测的事件拼回流首，保持原顺序。
+    let head = futures::stream::iter(first);
+    Ok((Box::pin(head.chain(stream)), id))
+}
+
+/// 单次上游流启动（不含重试）。cache_key 一次性，每次调用都会重新申请。
+async fn start_stream_once(
+    state: &SharedState,
+    prompt: &str,
+    conv_uuid: &str,
+) -> AppResult<(TranslatedStream, String)> {
     let cache_key = state.upstream.cache_message(prompt).await?;
     let sid = conv_uuid.to_string();
     let raw = state
@@ -333,6 +442,13 @@ async fn anthropic_messages(
                     });
                     evs.push(Ok(Event::default().event("error").data(body.to_string())));
                 }
+                Ok(oai::Translated::Quota(m)) => {
+                    let body = serde_json::json!({
+                        "type": "error",
+                        "error": {"type": "rate_limit_error", "message": m}
+                    });
+                    evs.push(Ok(Event::default().event("error").data(body.to_string())));
+                }
                 Err(e) => {
                     let body = serde_json::json!({
                         "type": "error",
@@ -356,6 +472,7 @@ async fn anthropic_messages(
             Ok(oai::Translated::Error(e)) => {
                 return Err(AppError::UpstreamStream(e));
             }
+            Ok(oai::Translated::Quota(m)) => return Err(AppError::QuotaExhausted(m)),
             Err(e) => return Err(e),
         }
     }
@@ -367,7 +484,7 @@ async fn anthropic_messages(
         "content": [{"type": "text", "text": full}],
         "stop_reason": "end_turn",
         "stop_sequence": null,
-        "usage": {"input_tokens": 0, "output_tokens": (full.chars().count() as u32).div_ceil(4)},
+        "usage": {"input_tokens": estimate_tokens(&prompt), "output_tokens": estimate_tokens(&full)},
     });
     Ok(Json(body).into_response())
 }
@@ -397,8 +514,33 @@ async fn count_tokens(
                 .join("\n")
         }
     };
-    let tokens = (text.chars().count() as u32).div_ceil(4).max(1);
+    let tokens = estimate_tokens(&text);
     Ok(Json(serde_json::json!({ "input_tokens": tokens })))
+}
+
+/// 粗略 token 估算：CJK 字符约 1 token/字，其它约 1 token/4 字符（P2-8：修正中文严重低估）。
+fn estimate_tokens(text: &str) -> u32 {
+    let mut cjk = 0u64;
+    let mut other = 0u64;
+    for ch in text.chars() {
+        if is_cjk(ch) {
+            cjk += 1;
+        } else {
+            other += 1;
+        }
+    }
+    (cjk + other.div_ceil(4)).max(1) as u32
+}
+
+fn is_cjk(c: char) -> bool {
+    matches!(c as u32,
+        0x3040..=0x30FF        // 日文假名
+        | 0x3400..=0x4DBF      // CJK 扩展 A
+        | 0x4E00..=0x9FFF      // CJK 基本汉字
+        | 0xF900..=0xFAFF      // CJK 兼容
+        | 0xAC00..=0xD7AF      // 韩文音节
+        | 0x20000..=0x2FA1F    // CJK 扩展 B+
+    )
 }
 
 /// 会话 TTL 常量（供 main 使用）。

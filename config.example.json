@@ -11,6 +11,10 @@
   "solver_timeout_secs": 120,
   "http_timeout_secs": 120,
   "cookie_ttl_secs": 1800,
-  "pseudo_chunk_chars": 0,
-  "cors_allow_origins": []
+  "cors_allow_origins": [],
+  "solver_retries": 2,
+  "breaker_fail_threshold": 5,
+  "breaker_cooldown_secs": 30,
+  "max_concurrency": 0,
+  "rate_limit_per_sec": 0
 }

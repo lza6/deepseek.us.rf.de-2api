@@ -97,6 +97,79 @@ async fn mock_sse(
     Sse::new(futures::stream::iter(events))
 }
 
+/// 首次 cache_key（k0）→ ts_required；之后 → 正常流（验证自愈重试）。
+async fn spawn_mock_upstream_ts_required() -> String {
+    let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let c1 = count.clone();
+    let app = Router::new().route("/", get(mock_home)).route(
+        "/wp-admin/admin-ajax.php",
+        post(move |f: axum::extract::Form<Form>| {
+            let c = c1.clone();
+            async move {
+                match f.action.as_str() {
+                    "deepseek_ts_verify" => (
+                        axum::http::StatusCode::OK,
+                        axum::http::HeaderMap::new(),
+                        r#"{"ok":true}"#.to_string(),
+                    ),
+                    "aipkit_get_frontend_chat_nonce" => (
+                        axum::http::StatusCode::OK,
+                        axum::http::HeaderMap::new(),
+                        r#"{"success":true,"data":{"nonce":"n"}}"#.to_string(),
+                    ),
+                    "aipkit_cache_sse_message" => {
+                        let n = c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        (
+                            axum::http::StatusCode::OK,
+                            axum::http::HeaderMap::new(),
+                            format!(r#"{{"success":true,"data":{{"cache_key":"k{n}"}}}}"#),
+                        )
+                    }
+                    _ => (
+                        axum::http::StatusCode::OK,
+                        axum::http::HeaderMap::new(),
+                        r#"{"success":false}"#.to_string(),
+                    ),
+                }
+            }
+        })
+        .get(mock_sse_ts_required),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    format!("http://{}", addr)
+}
+
+/// cache_key=k0 → ts_required；其余 → 正常文本流。
+async fn mock_sse_ts_required(
+    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    if q.get("cache_key").map(|s| s.as_str()) == Some("k0") {
+        let events = vec![
+            Ok::<_, Infallible>(
+                Event::default()
+                    .event("error")
+                    .data(r#"{"error":"Sicherheitspruefung erforderlich.","ts_required":true}"#),
+            ),
+            Ok(Event::default().event("done").data(r#"{"finished":true}"#)),
+        ];
+        return Sse::new(futures::stream::iter(events));
+    }
+    let events = vec![
+        Ok::<_, Infallible>(
+            Event::default()
+                .event("message_start")
+                .data(r#"{"message_id":"m1"}"#),
+        ),
+        Ok(Event::default().data(r#"{"delta":"recuperado"}"#)),
+        Ok(Event::default().event("done").data(r#"{"finished":true}"#)),
+    ];
+    Sse::new(futures::stream::iter(events))
+}
+
 /// 启动 mock 求解器。
 async fn spawn_mock_solver() -> String {
     #[derive(serde::Deserialize)]
@@ -311,6 +384,48 @@ async fn bad_request_empty_messages() {
 }
 
 #[tokio::test]
+async fn ts_required_triggers_reauth_and_retry() {
+    // 首次 SSE 返回 ts_required，第二次返回正常文本：验证自愈重试。
+    let upstream = spawn_mock_upstream_ts_required().await;
+    let solver = spawn_mock_solver().await;
+    let cfg = deepseek_es_2api::Config {
+        upstream_base_url: upstream,
+        cf_solver_url: solver,
+        solver_timeout_secs: 10,
+        listen_addr: "127.0.0.1:0".into(),
+        ..Default::default()
+    };
+    let client = Arc::new(deepseek_es_2api::UpstreamClient::new(cfg.clone()).unwrap());
+    let state = Arc::new(deepseek_es_2api::api::AppState {
+        cfg,
+        upstream: client,
+        sessions: deepseek_es_2api::session::SessionStore::new(Duration::from_secs(60)),
+    });
+    let app = deepseek_es_2api::api::build_router(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let base = format!("http://{}", addr);
+
+    // 非流式：应自动重认证并返回完整回复，而非 502
+    let r = reqwest::Client::new()
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&serde_json::json!({
+            "model": "deepseek-es",
+            "messages": [{"role":"user","content":"hola"}],
+            "stream": false
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200, "自愈后应 200");
+    let v: serde_json::Value = r.json().await.unwrap();
+    assert_eq!(v["choices"][0]["message"]["content"], "recuperado");
+}
+
+#[tokio::test]
 async fn auth_enforced_when_keys_configured() {
     // 单独构造一个带 key 的网关
     let upstream = spawn_mock_upstream().await;
@@ -347,4 +462,252 @@ async fn auth_enforced_when_keys_configured() {
         .await
         .unwrap();
     assert_eq!(r.status(), 200);
+}
+
+// ── 通用网关启动（可改配置）───────────────────────────────
+
+async fn serve_gateway(
+    upstream_url: String,
+    solver_url: String,
+    mutate: impl FnOnce(&mut deepseek_es_2api::Config),
+) -> String {
+    let mut cfg = deepseek_es_2api::Config {
+        upstream_base_url: upstream_url,
+        cf_solver_url: solver_url,
+        solver_timeout_secs: 10,
+        listen_addr: "127.0.0.1:0".into(),
+        ..Default::default()
+    };
+    mutate(&mut cfg);
+    let client = Arc::new(deepseek_es_2api::UpstreamClient::new(cfg.clone()).unwrap());
+    let state = Arc::new(deepseek_es_2api::api::AppState {
+        cfg,
+        upstream: client,
+        sessions: deepseek_es_2api::session::SessionStore::new(Duration::from_secs(60)),
+    });
+    let app = deepseek_es_2api::api::build_router(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    format!("http://{}", addr)
+}
+
+/// mock 上游：SSE 首个事件为配额耗尽（quota_notice）。
+async fn spawn_mock_upstream_quota() -> String {
+    let app = Router::new().route("/", get(mock_home)).route(
+        "/wp-admin/admin-ajax.php",
+        post(mock_ajax).get(mock_sse_quota),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    format!("http://{}", addr)
+}
+
+async fn mock_sse_quota(
+    _q: axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    let events = vec![Ok::<_, Infallible>(Event::default().event("error").data(
+        r#"{"error":"Cuota diaria agotada","quota_notice":{"title":"t","message":"m"}}"#,
+    ))];
+    Sse::new(futures::stream::iter(events))
+}
+
+/// 一直失败的求解器。
+async fn spawn_mock_solver_fail() -> String {
+    let app = Router::new()
+        .route(
+            "/turnstile",
+            get(|| async { Json(serde_json::json!({"task_id":"t","status":"accepted"})) }),
+        )
+        .route(
+            "/result",
+            get(|| async { Json(serde_json::json!({"status":"error","message":"boom"})) }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    format!("http://{}", addr)
+}
+
+/// 首次求解失败、之后成功的求解器。
+async fn spawn_mock_solver_flaky_once() -> String {
+    let n = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let n1 = n.clone();
+    let app = Router::new()
+        .route(
+            "/turnstile",
+            get(move || {
+                let n = n1.clone();
+                async move {
+                    let id = n.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    Json(serde_json::json!({"task_id": format!("t{id}"), "status":"accepted"}))
+                }
+            }),
+        )
+        .route(
+            "/result",
+            get(
+                |axum::extract::Query(q): axum::extract::Query<
+                    std::collections::HashMap<String, String>,
+                >| async move {
+                    let id = q.get("id").cloned().unwrap_or_default();
+                    if id == "t0" {
+                        Json(serde_json::json!({"status":"error","message":"boom"}))
+                    } else {
+                        Json(serde_json::json!({"status":"success","value":"valid-token"}))
+                    }
+                },
+            ),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    format!("http://{}", addr)
+}
+
+// ── P1-3：配额 → 429 ─────────────────────────────────────
+
+#[tokio::test]
+async fn quota_exhausted_returns_429() {
+    let base = serve_gateway(
+        spawn_mock_upstream_quota().await,
+        spawn_mock_solver().await,
+        |_| {},
+    )
+    .await;
+    let r = reqwest::Client::new()
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&serde_json::json!({
+            "model": "deepseek-es",
+            "messages": [{"role":"user","content":"hi"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 429, "配额耗尽应映射 429");
+    let v: serde_json::Value = r.json().await.unwrap();
+    assert_eq!(v["error"]["type"], "rate_limit_error");
+}
+
+// ── P1-5：求解重试 ───────────────────────────────────────
+
+#[tokio::test]
+async fn solver_retry_recovers_from_transient_failure() {
+    let base = serve_gateway(
+        spawn_mock_upstream().await,
+        spawn_mock_solver_flaky_once().await,
+        |c| c.solver_retries = 2,
+    )
+    .await;
+    let r = reqwest::Client::new()
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&serde_json::json!({
+            "model": "deepseek-es",
+            "messages": [{"role":"user","content":"hi"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200, "求解首次失败后重试应成功");
+    let v: serde_json::Value = r.json().await.unwrap();
+    assert_eq!(v["choices"][0]["message"]["content"], "Hola mundo");
+}
+
+// ── P1-5：熔断 ───────────────────────────────────────────
+
+#[tokio::test]
+async fn circuit_breaker_opens_after_failures() {
+    let base = serve_gateway(
+        spawn_mock_upstream().await,
+        spawn_mock_solver_fail().await,
+        |c| {
+            c.solver_retries = 0;
+            c.breaker_fail_threshold = 1;
+            c.breaker_cooldown_secs = 60;
+        },
+    )
+    .await;
+    let client = reqwest::Client::new();
+    let body = |b: &str| b.to_string();
+    // 第一次：真实求解失败 → 熔断打开
+    let b1 = client
+        .post(format!("{base}/v1/chat/completions"))
+        .json(
+            &serde_json::json!({"model":"deepseek-es","messages":[{"role":"user","content":"hi"}]}),
+        )
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        body(&b1).contains("求解") || body(&b1).contains("失败"),
+        "b1={b1}"
+    );
+    // 第二次：熔断 → 快速失败且提示熔断
+    let b2 = client
+        .post(format!("{base}/v1/chat/completions"))
+        .json(
+            &serde_json::json!({"model":"deepseek-es","messages":[{"role":"user","content":"hi"}]}),
+        )
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(body(&b2).contains("熔断"), "第二次应被熔断: {b2}");
+}
+
+// ── P1-5：限流 ───────────────────────────────────────────
+
+#[tokio::test]
+async fn rate_limit_returns_429() {
+    let base = serve_gateway(
+        spawn_mock_upstream().await,
+        spawn_mock_solver().await,
+        |c| c.rate_limit_per_sec = 2,
+    )
+    .await;
+    let client = reqwest::Client::new();
+    let mut got_429 = 0;
+    for _ in 0..10 {
+        let r = client
+            .get(format!("{base}/v1/models"))
+            .send()
+            .await
+            .unwrap();
+        if r.status() == 429 {
+            got_429 += 1;
+        }
+    }
+    assert!(got_429 >= 1, "突发请求应触发限流 (429 计数={got_429})");
+}
+
+// ── P1-2：模型诚实化 ─────────────────────────────────────
+
+#[tokio::test]
+async fn models_single_routable() {
+    let base = spawn_gateway().await;
+    let v: serde_json::Value = reqwest::get(format!("{base}/v1/models"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let data = v["data"].as_array().unwrap();
+    assert_eq!(data.len(), 1, "应仅暴露单一真实模型");
+    assert_eq!(data[0]["id"], "deepseek-es");
+    assert_eq!(data[0]["routable"], true);
+    assert!(data[0]["alias_of"].is_null());
 }

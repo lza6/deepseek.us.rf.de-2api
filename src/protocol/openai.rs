@@ -213,7 +213,7 @@ pub fn stop_chunk(id: &str, model: &str) -> ChatChunk {
     }
 }
 
-/// 把上游 SSE 事件翻译为「文本增量」或「结束信号」或「错误」。
+/// 把上游 SSE 事件翻译为「文本增量」或「结束信号」或「错误」或「配额耗尽」。
 #[derive(Debug, PartialEq)]
 pub enum Translated {
     /// 文本增量
@@ -222,6 +222,8 @@ pub enum Translated {
     Done,
     /// 错误
     Error(String),
+    /// 配额耗尽（上游 quota_notice，需映射 429）
+    Quota(String),
 }
 
 /// 解析上游 SSE 事件 → 翻译结果。非文本事件返回 None。
@@ -243,6 +245,15 @@ pub fn translate_event(ev: &SseEvent) -> Option<Translated> {
         "done" => Some(Translated::Done),
         "error" => {
             let v: serde_json::Value = serde_json::from_str(&ev.data).unwrap_or_default();
+            // 配额耗尽：优先识别（映射 429），与普通错误区分
+            if v.get("quota_notice").map(|q| !q.is_null()).unwrap_or(false) {
+                let msg = v
+                    .get("error")
+                    .and_then(|e| e.as_str())
+                    .unwrap_or("上游配额耗尽")
+                    .to_string();
+                return Some(Translated::Quota(msg));
+            }
             let msg = v
                 .get("error")
                 .and_then(|e| e.as_str())
@@ -385,5 +396,29 @@ mod tests {
         assert!(s.contains("\"delta\":{\"content\":\"x\"}"));
         assert!(s.contains("chat.completion.chunk"));
         assert!(!s.contains("role"));
+    }
+
+    #[test]
+    fn translate_quota_notice() {
+        let ev = SseEvent {
+            event: "error".into(),
+            data: r#"{"error":"Cuota agotada","quota_notice":{"title":"t","message":"m","actions":[]}}"#.into(),
+        };
+        assert_eq!(
+            translate_event(&ev),
+            Some(Translated::Quota("Cuota agotada".into()))
+        );
+    }
+
+    #[test]
+    fn translate_quota_without_error_field() {
+        let ev = SseEvent {
+            event: "error".into(),
+            data: r#"{"quota_notice":{"title":"t"}}"#.into(),
+        };
+        assert_eq!(
+            translate_event(&ev),
+            Some(Translated::Quota("上游配额耗尽".into()))
+        );
     }
 }
