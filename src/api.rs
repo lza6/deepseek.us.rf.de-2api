@@ -425,6 +425,39 @@ async fn openai_chat_inner(
                 .map(futures::stream::iter)
                 .flatten(),
             )
+            // L3：`stream_options.include_usage` 时，在 [DONE] 前插一帧 usage
+            .chain(futures::stream::once({
+                let id = id_m7.clone();
+                let model = model_m7.clone();
+                let acc = acc.clone();
+                let prompt_tokens = estimate_tokens(&prompt);
+                let include = req
+                    .stream_options
+                    .as_ref()
+                    .map(|o| o.include_usage)
+                    .unwrap_or(false);
+                async move {
+                    if !include {
+                        Vec::new()
+                    } else {
+                        let pt = prompt_tokens;
+                        let ct = (acc.load(std::sync::atomic::Ordering::Relaxed) / 2).max(1) as u32;
+                        let data = serde_json::to_string(&oai::usage_chunk(
+                            &id,
+                            &model,
+                            oai::Usage {
+                                prompt_tokens: pt,
+                                completion_tokens: ct,
+                                total_tokens: pt + ct,
+                            },
+                        ))
+                        .unwrap();
+                        vec![Ok::<_, Infallible>(Event::default().data(data))]
+                    }
+                }
+            })
+            .map(futures::stream::iter)
+            .flatten())
             .chain(futures::stream::once({
                 let replay = replay.clone();
                 let rid = rid.clone();
@@ -567,6 +600,13 @@ fn now_secs() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+/// L4：把内部 `chatcmpl-<hex>` id 转成 Anthropic 惯例的 `msg_<hex>`。
+///
+/// 部分 Anthropic 客户端据 `msg_` 前缀判别消息类型；不改则可能被误判。
+fn to_anthropic_msg_id(chatcmpl_id: &str) -> String {
+    format!("msg_{}", chatcmpl_id.trim_start_matches("chatcmpl-"))
 }
 
 fn chat_completion(model: &str, content: String, prompt: &str) -> oai::ChatCompletion {
@@ -834,12 +874,36 @@ async fn anthropic_messages_inner(
         .map(|s| s.to_string());
     let (_sid, conv_uuid) = state.sessions.get_or_create(session_key.as_deref());
 
+    // L8：Anthropic 端点也接入响应缓存（此前仅 OpenAI 走，重复请求恒打上游）。
+    // 与 OpenAI 一致：仅非流式 + 无会话历史（纯单轮）时缓存，避免语义冲突。
+    let cacheable = session_key.is_none() && tool_defs.is_empty();
+    let cache_key = crate::cache::ResponseCache::key(&model_id, &prompt);
+    if !stream && cacheable {
+        if let Some(hit) = state.cache.get(cache_key) {
+            return Ok(Json(serde_json::json!({
+                "id": to_anthropic_msg_id(&format!("chatcmpl-{}", uuid::Uuid::new_v4().simple())),
+                "type": "message",
+                "role": "assistant",
+                "model": model_id,
+                "content": [{"type": "text", "text": hit}],
+                "stop_reason": "end_turn",
+                "stop_sequence": null,
+                "usage": {
+                    "input_tokens": estimate_tokens(&prompt),
+                    "output_tokens": estimate_tokens(&hit)
+                },
+            }))
+            .into_response());
+        }
+    }
+
     state.upstream.ensure_authed().await?;
     let (events, id) = start_stream(&state, &prompt, &conv_uuid, &model_id, &meta).await?;
 
     if stream {
         let model = model_id.clone();
-        let msg_id = id.clone();
+        // L4：Anthropic 惯例用 `msg_` 前缀（部分客户端据此判别消息类型）
+        let msg_id = to_anthropic_msg_id(&id);
         let mut state_started = false;
         let mut block_started = false;
         // M4：流式 usage 真实化（此前 message_start/message_delta 恒 0/0）
@@ -995,8 +1059,7 @@ async fn anthropic_messages_inner(
                             stop_reason: stop_reason.into(),
                             stop_sequence: None,
                         },
-                        usage: anth::AnthropicUsage {
-                            input_tokens: 0,
+                        usage: anth::OutputUsage {
                             output_tokens: (out_c.load(std::sync::atomic::Ordering::Relaxed) / 2)
                                 .max(1) as u32,
                         },
@@ -1063,8 +1126,7 @@ async fn anthropic_messages_inner(
                                 stop_reason: "end_turn".into(),
                                 stop_sequence: None,
                             },
-                            usage: anth::AnthropicUsage {
-                                input_tokens: 0,
+                            usage: anth::OutputUsage {
                                 output_tokens: (out_chars
                                     .load(std::sync::atomic::Ordering::Relaxed)
                                     / 2)
@@ -1163,7 +1225,7 @@ async fn anthropic_messages_inner(
         )
     };
     let body = serde_json::json!({
-        "id": id,
+        "id": to_anthropic_msg_id(&id),
         "type": "message",
         "role": "assistant",
         "model": model_id,
@@ -1172,6 +1234,10 @@ async fn anthropic_messages_inner(
         "stop_sequence": null,
         "usage": {"input_tokens": estimate_tokens(&prompt), "output_tokens": estimate_tokens(&full)},
     });
+    // L8：写入响应缓存（与 OpenAI 一致，仅可缓存的非流式单轮）
+    if cacheable && !full.is_empty() {
+        state.cache.put(cache_key, full.clone());
+    }
     // P3-3：Anthropic 非流式入账
     state
         .ledger

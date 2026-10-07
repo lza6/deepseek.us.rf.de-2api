@@ -2,6 +2,43 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/) 与 [语义化版本](https://semver.org/)。
 
+## [0.11.0] - 2026-10-07
+
+**L 级协议合规修复**（指南 §2.3）：关闭 L3/L4/L7/L8，均为真实客户端会遇到的协议偏差。
+
+### Fixed
+- **L3 · 流式无 usage、不支持 `stream_options.include_usage`**：OpenAI 客户端请求用量统计时拿不到数据。
+  修复：`ChatChunk` 增加 `usage` 字段；请求解析 `stream_options.include_usage`；
+  为 true 时在 `[DONE]` **之前**插入一帧 `choices:[] + usage`（符合 OpenAI 规范）。
+  测试：`stream_include_usage_emits_usage_chunk`、`stream_without_include_usage_has_no_usage_chunk`。
+- **L4 · Anthropic 消息 id 复用 `chatcmpl-` 前缀**：部分 Anthropic 客户端据 `msg_` 前缀判别消息类型。
+  修复：新增 `to_anthropic_msg_id()`，Anthropic 端（流式 + 非流式 + 缓存命中）统一输出 `msg_<hex>`。
+  测试：`anthropic_message_id_uses_msg_prefix`。
+- **L7 · `message_delta.usage` 误带 `input_tokens: 0`**：Anthropic 规范中该字段**只含 `output_tokens`**；
+  带 `input_tokens: 0` 会让合并 usage 的客户端把输入 token 归零。
+  修复：新增 `OutputUsage` 类型（仅 `output_tokens`），`MessageDelta.usage` 改用它。
+  测试：`message_delta_usage_has_no_input_tokens`。
+- **L8 · Anthropic 端点完全不走响应缓存**：OpenAI 走缓存而 Anthropic 不走，相同请求重复打上游。
+  修复：Anthropic 端点接入 `ResponseCache`（与 OpenAI 一致：仅非流式 + 无会话历史单轮；
+  含 `tools` 时不缓存，避免工具语义冲突）。
+  测试：`anthropic_nonstream_cache_hit`（第二次 <200ms）。
+
+### Added
+- `Cargo.toml` 版本 → 0.11.0。
+
+### Verified
+- `cargo test --all`：**138 单测 + 53 集成全绿**（较 v0.10.0 新增 5 集成）；fmt / clippy 干净。
+- **真实 E2E（针对最终二进制，22:52 构建）**：`e2e-v1` **8/8** + `e2e-meta` **5/5** 通过。
+- **压测**：8 并发 × 24 = **100%**，p50=2027ms、QPS 4.41。
+
+### 未做（如实说明）
+- **L6（流内 `created` 不一致）**：同一 SSE 流内各 chunk 的 `created` 可能在秒边界不同。
+  影响为纯 Cosmetic（客户端极少校验）。修复需把 `created` 穿透多个闭包，改动面大、
+  收益低，**暂不做**，记录于 `TASK-LEDGER.md`。
+- **L5/L9/L10**：见 `TASK-LEDGER.md`（低优先，非阻塞）。
+
+---
+
 ## [0.10.0] - 2026-10-07
 
 **反思自审发现的真实缺陷修复**（`/reflexion:reflect` 触发）。三项：一项**诚实性缺陷**（我自己的），两项真实工程缺陷。

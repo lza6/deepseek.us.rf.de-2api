@@ -30,6 +30,16 @@ pub struct ChatRequest {
     /// "auto"/"none"/"required"/{"type":"function","function":{"name":..}}
     #[serde(default)]
     pub tool_choice: Option<serde_json::Value>,
+    /// 流式选项。`{"include_usage": true}` 时在 `[DONE]` 前插入一帧带 usage 的 chunk。
+    #[serde(default)]
+    pub stream_options: Option<StreamOptions>,
+}
+
+/// OpenAI `stream_options`。
+#[derive(Debug, Clone, Deserialize)]
+pub struct StreamOptions {
+    #[serde(default)]
+    pub include_usage: bool,
 }
 
 /// OpenAI 工具声明包装：`{"type":"function","function":{...}}`。
@@ -265,6 +275,46 @@ pub struct ChatChunk {
     pub created: i64,
     pub model: String,
     pub choices: Vec<ChunkChoice>,
+    /// L3：`stream_options.include_usage` 时的末帧 usage（其余帧为 None）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<Usage>,
+}
+
+/// L3：构造流式末帧 usage chunk（OpenAI 规范：`choices` 为空数组 + `usage`）。
+pub fn usage_chunk(id: &str, model: &str, usage: Usage) -> ChatChunk {
+    usage_chunk_at(id, model, usage, now_secs())
+}
+
+/// L6：指定 `created` 的 usage chunk（同一流内应固定 `created`）。
+pub fn usage_chunk_at(id: &str, model: &str, usage: Usage, created: i64) -> ChatChunk {
+    ChatChunk {
+        id: id.to_string(),
+        object: "chat.completion.chunk".into(),
+        created,
+        model: model.to_string(),
+        choices: vec![],
+        usage: Some(usage),
+    }
+}
+
+/// 内部：给 chunk 的公共字段打底（避免每处重复 `usage: None`）。
+fn base(id: &str, model: &str, choices: Vec<ChunkChoice>) -> ChatChunk {
+    base_at(id, model, choices, now_secs())
+}
+
+/// L6：指定 `created` 的打底构造。
+///
+/// 同一流内所有 chunk 应共享同一 `created`（此前每 chunk 重取 `now_secs()`，
+/// 长流跨秒边界时不一致）。
+fn base_at(id: &str, model: &str, choices: Vec<ChunkChoice>, created: i64) -> ChatChunk {
+    ChatChunk {
+        id: id.to_string(),
+        object: "chat.completion.chunk".into(),
+        created,
+        model: model.to_string(),
+        choices,
+        usage: None,
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -309,12 +359,10 @@ fn now_secs() -> i64 {
 
 /// 生成首个 chunk（role 声明）。
 pub fn first_chunk(id: &str, model: &str) -> ChatChunk {
-    ChatChunk {
-        id: id.to_string(),
-        object: "chat.completion.chunk".into(),
-        created: now_secs(),
-        model: model.to_string(),
-        choices: vec![ChunkChoice {
+    base(
+        id,
+        model,
+        vec![ChunkChoice {
             index: 0,
             delta: Delta {
                 role: Some("assistant".into()),
@@ -322,16 +370,14 @@ pub fn first_chunk(id: &str, model: &str) -> ChatChunk {
             },
             finish_reason: None,
         }],
-    }
+    )
 }
 
 pub fn content_chunk(id: &str, model: &str, content: &str) -> ChatChunk {
-    ChatChunk {
-        id: id.to_string(),
-        object: "chat.completion.chunk".into(),
-        created: now_secs(),
-        model: model.to_string(),
-        choices: vec![ChunkChoice {
+    base(
+        id,
+        model,
+        vec![ChunkChoice {
             index: 0,
             delta: Delta {
                 content: Some(content.to_string()),
@@ -339,7 +385,7 @@ pub fn content_chunk(id: &str, model: &str, content: &str) -> ChatChunk {
             },
             finish_reason: None,
         }],
-    }
+    )
 }
 
 pub fn stop_chunk(id: &str, model: &str) -> ChatChunk {
@@ -348,17 +394,15 @@ pub fn stop_chunk(id: &str, model: &str) -> ChatChunk {
 
 /// 带指定 finish_reason 的结束 chunk（v2.0.0：`tool_calls` 场景）。
 pub fn stop_chunk_reason(id: &str, model: &str, reason: &str) -> ChatChunk {
-    ChatChunk {
-        id: id.to_string(),
-        object: "chat.completion.chunk".into(),
-        created: now_secs(),
-        model: model.to_string(),
-        choices: vec![ChunkChoice {
+    base(
+        id,
+        model,
+        vec![ChunkChoice {
             index: 0,
             delta: Delta::default(),
             finish_reason: Some(reason.into()),
         }],
-    }
+    )
 }
 
 /// v2.0.0：构造一次工具调用的流式增量 chunk（含完整参数）。
@@ -370,12 +414,10 @@ pub fn tool_call_chunk(
     name: &str,
     arguments: &str,
 ) -> ChatChunk {
-    ChatChunk {
-        id: id.to_string(),
-        object: "chat.completion.chunk".into(),
-        created: now_secs(),
-        model: model.to_string(),
-        choices: vec![ChunkChoice {
+    base(
+        id,
+        model,
+        vec![ChunkChoice {
             index: 0,
             delta: Delta {
                 tool_calls: Some(vec![ToolCallDelta {
@@ -391,7 +433,82 @@ pub fn tool_call_chunk(
             },
             finish_reason: None,
         }],
-    }
+    )
+}
+
+/// L6：指定 created 的版本（流内共享同一时间戳）。
+pub fn first_chunk_at(id: &str, model: &str, created: i64) -> ChatChunk {
+    base_at(
+        id,
+        model,
+        vec![ChunkChoice {
+            index: 0,
+            delta: Delta {
+                role: Some("assistant".into()),
+                ..Default::default()
+            },
+            finish_reason: None,
+        }],
+        created,
+    )
+}
+pub fn content_chunk_at(id: &str, model: &str, content: &str, created: i64) -> ChatChunk {
+    base_at(
+        id,
+        model,
+        vec![ChunkChoice {
+            index: 0,
+            delta: Delta {
+                content: Some(content.to_string()),
+                ..Default::default()
+            },
+            finish_reason: None,
+        }],
+        created,
+    )
+}
+pub fn stop_chunk_reason_at(id: &str, model: &str, reason: &str, created: i64) -> ChatChunk {
+    base_at(
+        id,
+        model,
+        vec![ChunkChoice {
+            index: 0,
+            delta: Delta::default(),
+            finish_reason: Some(reason.into()),
+        }],
+        created,
+    )
+}
+pub fn tool_call_chunk_at(
+    id: &str,
+    model: &str,
+    index: u32,
+    call_id: &str,
+    name: &str,
+    arguments: &str,
+    created: i64,
+) -> ChatChunk {
+    base_at(
+        id,
+        model,
+        vec![ChunkChoice {
+            index: 0,
+            delta: Delta {
+                tool_calls: Some(vec![ToolCallDelta {
+                    index,
+                    id: Some(call_id.to_string()),
+                    kind: Some("function".into()),
+                    function: ToolCallDeltaFunction {
+                        name: Some(name.to_string()),
+                        arguments: Some(arguments.to_string()),
+                    },
+                }]),
+                ..Default::default()
+            },
+            finish_reason: None,
+        }],
+        created,
+    )
 }
 
 /// 把上游 SSE 事件翻译为「文本增量」或「结束信号」或「错误」或「配额耗尽」。
@@ -488,6 +605,7 @@ mod tests {
             user: None,
             tools: None,
             tool_choice: None,
+            stream_options: None,
         };
         assert_eq!(messages_to_prompt(&req).unwrap(), "hello");
     }
@@ -503,6 +621,7 @@ mod tests {
             user: None,
             tools: None,
             tool_choice: None,
+            stream_options: None,
         };
         assert_eq!(messages_to_prompt(&req).unwrap(), "be brief\n\nhi");
     }
@@ -523,6 +642,7 @@ mod tests {
             user: None,
             tools: None,
             tool_choice: None,
+            stream_options: None,
         };
         let p = messages_to_prompt(&req).unwrap();
         assert!(
@@ -542,6 +662,7 @@ mod tests {
             user: None,
             tools: None,
             tool_choice: None,
+            stream_options: None,
         };
         assert!(messages_to_prompt(&req).is_err());
     }
@@ -654,6 +775,7 @@ mod tests {
             user: None,
             tools: None,
             tool_choice: None,
+            stream_options: None,
         };
         let p = messages_to_prompt(&req).unwrap();
         assert!(p.contains("我叫小明"), "首轮 user 丢失: {p}");
@@ -673,6 +795,7 @@ mod tests {
             user: None,
             tools: None,
             tool_choice: None,
+            stream_options: None,
         };
         let p = messages_to_prompt(&req).unwrap();
         assert!(p.contains("user: A") || p.contains("A"), "{p}");
@@ -697,6 +820,7 @@ mod tests {
             user: None,
             tools: None,
             tool_choice: None,
+            stream_options: None,
         };
         assert_eq!(messages_to_prompt(&req).unwrap(), "hello");
     }
@@ -717,6 +841,7 @@ mod tests {
             user: None,
             tools: None,
             tool_choice: None,
+            stream_options: None,
         };
         let p = messages_to_prompt(&req).unwrap();
         assert!(p.starts_with("be brief"), "system 应在最前: {p}");
@@ -759,6 +884,7 @@ mod tests {
             user: None,
             tools: None,
             tool_choice: None,
+            stream_options: None,
         };
         assert!(tool_defs(&req).is_empty());
     }
@@ -796,6 +922,7 @@ mod tests {
             user: None,
             tools: None,
             tool_choice: None,
+            stream_options: None,
         };
         let p = messages_to_prompt(&req).unwrap();
         assert!(p.contains("get_weather"), "工具调用名应出现: {p}");
@@ -820,6 +947,7 @@ mod tests {
             user: None,
             tools: None,
             tool_choice: None,
+            stream_options: None,
         };
         assert!(messages_to_prompt(&req).is_ok());
     }

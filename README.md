@@ -103,13 +103,14 @@ claude
 
 | 特性 | 配置 | 说明 |
 |------|------|------|
-| **请求级响应缓存** | `cache_ttl_secs` | 相同 prompt（**无会话语义**）短时复用，降低上游压力 |
+| **请求级响应缓存** | `cache_ttl_secs` | 相同 prompt（**无会话语义**）短时复用；OpenAI 与 Anthropic **两端均生效** |
 | **用量账本** | `ledger_path` | SQLite 持久化（`usage.db`）；空 = 关闭 |
 | **多 solver 负载均衡** | `solver_urls` | 轮询 + 健康探测 + 故障转移；空则用 `cf_solver_url` |
 | **语言注入** | `system_prompt_suffix` | 追加 system 指令（如"用用户语言回答"） |
 | **多轮对话** | — | 客户端发送的完整消息历史会被渲染进 prompt（见下） |
 | **工具调用** | — | 协议级 `tools`/`tool_calls`（OpenAI）与 `tools`/`tool_use`（Anthropic），见下 |
 | **伪工具调用** | `pseudo_tools_enabled` | 网关**本地执行**工具（与上面「工具调用」不同，见下） |
+| **流式用量** | — | `stream_options.include_usage` → 在 `[DONE]` 前返回 usage 帧 |
 | **断线重放** | — | SSE 事件带 `id:`；见下方限制说明 |
 
 > **工具调用（协议级，v0.7.0）**：客户端在请求里传 `tools` 即启用。上游虽**不支持原生

@@ -376,7 +376,16 @@ pub struct MessageDelta {
     #[serde(rename = "type")]
     pub kind: &'static str,
     pub delta: DeltaStop,
-    pub usage: AnthropicUsage,
+    /// L7：Anthropic 规范中 `message_delta.usage` **只含** `output_tokens`
+    /// （`input_tokens` 在 `message_start` 里给）。此前误带 `input_tokens: 0`，
+    /// 会让合并 usage 的客户端把输入 token 归零。
+    pub usage: OutputUsage,
+}
+
+/// L7：`message_delta` 的 usage（仅 output_tokens）。
+#[derive(Debug, Serialize)]
+pub struct OutputUsage {
+    pub output_tokens: u32,
 }
 
 #[derive(Debug, Serialize)]

@@ -2103,3 +2103,152 @@ async fn body_within_configured_limit_accepted() {
     // 不应是 413（解析/上游可能失败，但绝不是 body 超限）
     assert_ne!(r.status(), 413, "2.5MB 在 3MB 上限内不应 413");
 }
+
+// ── L3：stream_options.include_usage 产出 usage 帧 ─────────────
+
+#[tokio::test]
+async fn stream_include_usage_emits_usage_chunk() {
+    let base = spawn_gateway().await;
+    let body = reqwest::Client::new()
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&serde_json::json!({
+            "model":"deepseek-es",
+            "messages":[{"role":"user","content":"hi"}],
+            "stream":true,
+            "stream_options":{"include_usage":true}
+        }))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    // 应有含 "usage" 且 choices 为空的帧（在 [DONE] 前）
+    let has_usage = body
+        .lines()
+        .filter(|l| l.starts_with("data:"))
+        .filter_map(|l| l.trim_start_matches("data:").trim().strip_prefix('{'))
+        .any(|j| {
+            serde_json::from_str::<serde_json::Value>(&format!("{{{j}"))
+                .map(|v| {
+                    v.get("usage").map(|u| !u.is_null()).unwrap_or(false)
+                        && v["choices"]
+                            .as_array()
+                            .map(|a| a.is_empty())
+                            .unwrap_or(false)
+                })
+                .unwrap_or(false)
+        });
+    assert!(has_usage, "未产出 usage 帧: {body}");
+    // usage 帧必须在 [DONE] 之前
+    let usage_pos = body.find("\"usage\"").expect("有 usage");
+    let done_pos = body.find("[DONE]").expect("有 DONE");
+    assert!(usage_pos < done_pos, "usage 帧应在 [DONE] 之前");
+}
+
+/// 未请求 include_usage 时不应有 usage 帧（默认行为不变）。
+#[tokio::test]
+async fn stream_without_include_usage_has_no_usage_chunk() {
+    let base = spawn_gateway().await;
+    let body = reqwest::Client::new()
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&serde_json::json!({
+            "model":"deepseek-es","messages":[{"role":"user","content":"hi"}],"stream":true
+        }))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(!body.contains("\"usage\""), "默认不应有 usage 帧: {body}");
+}
+
+// ── L4：Anthropic 消息 id 用 msg_ 前缀 ───────────────────────
+
+#[tokio::test]
+async fn anthropic_message_id_uses_msg_prefix() {
+    let base = spawn_gateway().await;
+    let v: serde_json::Value = reqwest::Client::new()
+        .post(format!("{base}/v1/messages"))
+        .json(&serde_json::json!({
+            "model":"deepseek-es","max_tokens":50,
+            "messages":[{"role":"user","content":"hi"}]
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let id = v["id"].as_str().unwrap();
+    assert!(id.starts_with("msg_"), "Anthropic id 应为 msg_ 前缀: {id}");
+}
+
+// ── L7：message_delta.usage 只含 output_tokens ───────────────
+
+#[tokio::test]
+async fn message_delta_usage_has_no_input_tokens() {
+    let base = spawn_gateway().await;
+    let body = reqwest::Client::new()
+        .post(format!("{base}/v1/messages"))
+        .json(&serde_json::json!({
+            "model":"deepseek-es","max_tokens":50,
+            "messages":[{"role":"user","content":"hi"}],"stream":true
+        }))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    // 找 message_delta 后面的 data 行
+    let lines: Vec<&str> = body.lines().collect();
+    let md_idx = lines
+        .iter()
+        .position(|l| l.contains("message_delta"))
+        .expect("有 message_delta");
+    let data_line = lines[md_idx..]
+        .iter()
+        .find(|l| l.starts_with("data:"))
+        .unwrap();
+    let v: serde_json::Value =
+        serde_json::from_str(data_line.trim_start_matches("data:").trim()).unwrap();
+    let usage = &v["usage"];
+    assert!(
+        usage.get("output_tokens").is_some(),
+        "应含 output_tokens: {v}"
+    );
+    assert!(
+        usage.get("input_tokens").is_none(),
+        "message_delta 不应含 input_tokens: {v}"
+    );
+}
+
+// ── L8：Anthropic 端点接入响应缓存 ───────────────────────────
+
+/// 相同非流式 Anthropic 请求第二次应命中缓存（第二次更快、内容一致）。
+#[tokio::test]
+async fn anthropic_nonstream_cache_hit() {
+    let base = spawn_gateway().await;
+    let body = serde_json::json!({
+        "model":"deepseek-es","max_tokens":50,
+        "messages":[{"role":"user","content":"cache-me-please"}]
+    });
+    let post = || {
+        let b = body.clone();
+        reqwest::Client::new()
+            .post(format!("{base}/v1/messages"))
+            .json(&b)
+            .send()
+    };
+    let r1: serde_json::Value = post().await.unwrap().json().await.unwrap();
+    let t0 = std::time::Instant::now();
+    let r2: serde_json::Value = post().await.unwrap().json().await.unwrap();
+    let t1 = t0.elapsed();
+    // 第一次与第二次内容一致，且第二次应显著更快（命中缓存，未打上游）
+    let c1 = r1["content"][0]["text"].as_str().unwrap_or("");
+    let c2 = r2["content"][0]["text"].as_str().unwrap_or("");
+    assert_eq!(c1, c2, "缓存命中内容应一致");
+    assert!(t1.as_millis() < 200, "缓存命中应很快，实际 {:?}", t1);
+}
