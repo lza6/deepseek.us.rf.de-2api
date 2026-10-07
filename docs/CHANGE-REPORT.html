@@ -1,0 +1,158 @@
+<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>deepseek-es-2api 变更报告 · v0.4.0 → v0.9.0</title>
+<style>
+:root{--bg:#0d1117;--panel:#161b22;--line:#30363d;--fg:#e6edf3;--muted:#8b949e;
+--accent:#3fb950;--accent2:#58a6ff;--warn:#d29922;--err:#f85149;--mono:ui-monospace,SFMono-Regular,Menlo,monospace}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.7 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif}
+.wrap{max-width:900px;margin:0 auto;padding:40px 24px 80px}
+h1{font-size:26px;letter-spacing:.5px;margin:0 0 8px}
+h2{font-size:18px;margin:40px 0 12px;padding-bottom:8px;border-bottom:1px solid var(--line);color:var(--accent2)}
+h3{font-size:15px;margin:24px 0 8px;color:var(--fg)}
+.sub{color:var(--muted);font-size:13px;margin-bottom:24px}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:16px 20px;margin:12px 0}
+.badge{display:inline-block;padding:2px 8px;border-radius:999px;font-size:12px;border:1px solid var(--line);color:var(--muted);margin-right:6px}
+code{font-family:var(--mono);background:#1f242c;padding:1px 5px;border-radius:4px;font-size:13px}
+pre{background:#0b0f14;border:1px solid var(--line);border-radius:8px;padding:12px 14px;overflow-x:auto;font-family:var(--mono);font-size:12.5px;line-height:1.5}
+table{width:100%;border-collapse:collapse;font-size:13.5px;margin:10px 0}
+th,td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--line);vertical-align:top}
+th{color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.5px}
+.mono{font-family:var(--mono)}
+.quiz{background:var(--panel);border:1px solid var(--accent2);border-radius:10px;padding:20px;margin-top:20px}
+.q{margin:18px 0;padding-bottom:14px;border-bottom:1px solid var(--line)}
+.q p{font-weight:600;margin:0 0 8px}
+.opt{display:block;padding:7px 10px;margin:5px 0;border:1px solid var(--line);border-radius:6px;cursor:pointer;font-size:14px}
+.opt:hover{border-color:var(--accent2)}
+.opt input{margin-right:8px}
+.opt.correct{border-color:var(--accent);background:rgba(63,185,80,.1)}
+.opt.wrong{border-color:var(--err);background:rgba(248,81,73,.1)}
+button{background:var(--accent2);color:#0d1117;border:0;border-radius:6px;padding:10px 20px;font-size:14px;font-weight:600;cursor:pointer;margin-top:12px}
+button:hover{opacity:.9}
+.score{font-size:16px;font-weight:600;margin-top:14px}
+.note{color:var(--muted);font-size:13px;border-left:3px solid var(--line);padding-left:12px;margin:10px 0}
+</style></head><body><div class="wrap">
+
+<h1>deepseek-es-2api · 变更报告</h1>
+<div class="sub">v0.4.0 → v0.9.0 · 6 个版本 · 135 单测 + 46 集成全绿 · 全部经真实 E2E 验证</div>
+
+<h2>一、背景与直觉</h2>
+<div class="card">
+<p><b>项目是什么：</b>把 <code>deepseek.es</code>（WordPress + AIPKit 插件）包装成 <b>OpenAI 兼容</b>与
+<b>Anthropic 兼容</b>的 Rust API 网关。内置 Cloudflare Turnstile 求解。</p>
+<p><b>核心约束（决定了所有设计）：</b></p>
+<ul>
+<li>上游 <b>不支持</b>原生 function calling、图片、联网 —— 网关必须做<b>协议翻译</b>而非透传。</li>
+<li>上游 SSE <b>无 <code>id:</code> 行</b>且 <code>cache_key</code> 一次性 → 无法真正的断线续传，只能网关侧缓冲重放。</li>
+<li>本站只有 <b>单一 bot</b>（provider 固定 DeepSeek）→ 只暴露 1 个诚实模型。</li>
+</ul>
+<p><b>设计直觉：</b>网关是「翻译层 + 可靠性层」。翻译层负责协议转换；可靠性层负责认证、熔断、缓存、限流。
+两个原则贯穿始终：<b>不伪造</b>（上游没有的能力不假装支持）、<b>不静默</b>（任何丢弃/异常都要可观测）。</p>
+</div>
+
+<h2>二、做了什么（按版本）</h2>
+<table>
+<tr><th>版本</th><th>主题</th><th>关键修复/新增</th></tr>
+<tr><td class="mono">v0.4.0</td><td>静默数据损坏</td><td><b>H1</b> SSE 多字节字符被 chunk 边界截断损坏为替换符；<b>H2</b> 多轮对话历史被整体丢弃</td></tr>
+<tr><td class="mono">v0.5.0</td><td>协议正确性</td><td><b>H3</b> Anthropic 错误体是 OpenAI 结构；<b>H4</b> 伪工具说明从未注入；<b>M3/M4/M7/M11/M12</b></td></tr>
+<tr><td class="mono">v0.6.0</td><td>可靠性加固</td><td><b>M2</b> 长流被 120s 总超时截断；<b>M5</b> nonce 失效不重试；<b>M8</b> auth 头阻塞；<b>M9</b> 熔断半开</td></tr>
+<tr><td class="mono">v0.7.0</td><td>工具调用</td><td>协议级 <code>tool_calls</code>(OpenAI) + <code>tool_use</code>(Anthropic)，流式 hold-back 状态机</td></tr>
+<tr><td class="mono">v0.8.0</td><td>端点+瘦身</td><td><code>/v1/balance</code>、<code>/v1/conversations</code>；<b>M10</b> 流式配额 429；删死代码、仓库减 1.1MB</td></tr>
+<tr><td class="mono">v0.9.0</td><td>契约防坑</td><td><b>请求体反序列化失败返回 422 纯文本</b>而非协议错误结构（SDK 解析失败）→ 修复</td></tr>
+</table>
+
+<h3>最深的一个修复（H1）</h3>
+<div class="card">
+<p><b>症状：</b>中文/emoji 回复偶尔变成问号串。</p>
+<p><b>根因：</b>原实现逐网络 chunk 用 <code>String::from_utf8_lossy</code> 解码。
+但 TCP chunk 边界是<b>任意的</b>，可能落在一个 UTF-8 码点中间 —— 半个码点被替换为 <code>U+FFFD</code>。</p>
+<p><b>修复：</b>改为<b>字节级缓冲</b>（<code>Vec&lt;u8&gt;</code>），只在完整事件边界解码。顺带修了 CRLF 分帧 + 8MB 上限。</p>
+<p class="note">反证：临时恢复旧实现，「漢字テスト😀」→「??????????」；修复后完整保留。这是唯一一个会造成<b>静默内容损坏</b>的缺陷。</p>
+</div>
+
+<h3>最有技术含量的一个（v0.7.0 流式工具 hold-back）</h3>
+<div class="card">
+<p>模型输出 <code>```tool</code> 块时，普通文本流会把这个原始 JSON 泄漏给客户端。
+<code>StreamToolFilter</code> 状态机把工具块暂扣，且要处理 <b>fence 标记被 delta 切断</b>
+的场景（三个反引号分三次到达）。</p>
+<p class="note">用「保守放行」策略：只有确定不在 fence 中才放行，避免泄漏。</p>
+</div>
+
+<h2>三、真实 E2E 证据</h2>
+<pre>[OpenAI 工具往返]
+第1轮 finish_reason: tool_calls
+tool_calls: [{"function":{"name":"get_weather","arguments":"{\"city\":\"北京\"}"}}]
+本地执行 → {"city":"北京","temp_c":25,"condition":"晴"}
+第2轮: "北京今天天气晴，气温约 25°C。"
+
+[Anthropic 工具往返]
+stop_reason: tool_use → 执行 → 回传 → "上海今天天气：多云，气温约 22°C。"
+
+[/v1/balance] {"balance":0,"free":{"limit":30000,"remaining":30000,"used":0}}
+[/v1/conversations] {"data":[],"object":"list"}
+
+[压测] 8并发 × 24 请求 = 100% 成功，p50=1976ms</pre>
+
+<h2>四、验证测验（必须通过）</h2>
+<p class="sub">做完报告，检验你是否真的理解了这些变更。</p>
+<div class="quiz" id="quiz">
+  <div class="q" data-answer="c">
+    <p>1. H1（多字节损坏）的根因是什么？</p>
+    <label class="opt"><input type="radio" name="q1" value="a">上游返回了错误的 UTF-8</label>
+    <label class="opt"><input type="radio" name="q1" value="b">客户端解码方式不对</label>
+    <label class="opt"><input type="radio" name="q1" value="c">TCP chunk 边界可能落在 UTF-8 码点中间，逐 chunk lossy 解码损坏了字符</label>
+    <label class="opt"><input type="radio" name="q1" value="d">字符串缓冲区太小</label>
+  </div>
+  <div class="q" data-answer="b">
+    <p>2. 为什么上游不支持原生 function calling 时，网关仍能实现工具调用且「不是伪造」？</p>
+    <label class="opt"><input type="radio" name="q2" value="a">因为网关假装支持，客户端不会发现</label>
+    <label class="opt"><input type="radio" name="q2" value="b">因为网关做协议翻译：注入工具说明 → 解析模型输出 → 产出标准 tool_calls/tool_use，客户端能真实调用并回传结果</label>
+    <label class="opt"><input type="radio" name="q2" value="c">因为上游其实偷偷支持了</label>
+    <label class="opt"><input type="radio" name="q2" value="d">因为用 mock 数据模拟的</label>
+  </div>
+  <div class="q" data-answer="a">
+    <p>3. v0.9.0 修复的契约缺陷是什么？</p>
+    <label class="opt"><input type="radio" name="q3" value="a">请求体反序列化失败时返回 422 纯文本，而非协议原生错误结构，导致 SDK 解析失败</label>
+    <label class="opt"><input type="radio" name="q3" value="b">端点返回了错误的 HTTP 方法</label>
+    <label class="opt"><input type="radio" name="q3" value="c">缺少 CORS 头</label>
+    <label class="opt"><input type="radio" name="q3" value="d">限流阈值太低</label>
+  </div>
+  <div class="q" data-answer="d">
+    <p>4. M9（熔断半开）修复后，冷却结束时会怎样？</p>
+    <label class="opt"><input type="radio" name="q4" value="a">放行全部并发请求</label>
+    <label class="opt"><input type="radio" name="q4" value="b">永久拒绝</label>
+    <label class="opt"><input type="radio" name="q4" value="c">重置计数器后继续</label>
+    <label class="opt"><input type="radio" name="q4" value="d">只放行一个探测请求，失败立即重新熔断</label>
+  </div>
+  <div class="q" data-answer="c">
+    <p>5. 为什么断线重放无法实现真正的上游续传？</p>
+    <label class="opt"><input type="radio" name="q5" value="a">因为没写代码</label>
+    <label class="opt"><input type="radio" name="q5" value="b">因为太慢了</label>
+    <label class="opt"><input type="radio" name="q5" value="c">上游 SSE 不发 id: 行，且 cache_key 一次性</label>
+    <label class="opt"><input type="radio" name="q5" value="d">因为客户端不支持</label>
+  </div>
+  <button onclick="submitQuiz()">提交答案</button>
+  <div class="score" id="score"></div>
+</div>
+
+<script>
+function submitQuiz(){
+  var qs=document.querySelectorAll(".q");
+  var correct=0;
+  qs.forEach(function(q){
+    var ans=q.dataset.answer;
+    var picks=q.querySelectorAll("input");
+    var sel=null;
+    picks.forEach(function(p){p.closest(".opt").classList.remove("correct","wrong");
+      if(p.checked){sel=p.value; p.closest(".opt").classList.add(p.value===ans?"correct":"wrong");}});
+    picks.forEach(function(p){if(p.value===ans)p.closest(".opt").classList.add("correct");});
+    if(sel===ans)correct++;
+  });
+  var el=document.getElementById("score");
+  var pass=correct===qs.length;
+  el.innerHTML=(pass?"通过 ":"未通过 ")+"得分: "+correct+"/"+qs.length+(pass?" —— 通过！":" —— 未通过，请重读报告。");
+  el.style.color=pass?"#3fb950":"#f85149";
+}
+</script>
+</div></body></html>

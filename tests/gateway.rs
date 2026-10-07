@@ -1959,3 +1959,79 @@ async fn conversation_delete_requires_id() {
     assert_eq!(v["ok"], true, "{v}");
     assert_eq!(v["deleted"], "cv-1", "{v}");
 }
+
+// ── 契约防坑：请求体反序列化失败必须返回协议原生错误结构 ──────────
+
+/// Anthropic 端点收到畸形请求体 → 必须是 Anthropic 错误结构（非 axum 422 纯文本）。
+#[tokio::test]
+async fn anthropic_malformed_body_is_anthropic_shaped() {
+    let base = spawn_gateway().await;
+    // 缺 messages 字段
+    let r = reqwest::Client::new()
+        .post(format!("{base}/v1/messages"))
+        .header("content-type", "application/json")
+        .body(r#"{"model":"deepseek-es","max_tokens":10}"#)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 400, "应为 400，实际 {}", r.status());
+    let v: serde_json::Value = r.json().await.unwrap();
+    assert_eq!(v["type"], "error", "缺顶层 type:error: {v}");
+    assert!(v["error"]["message"].is_string(), "{v}");
+}
+
+/// Anthropic 端点完全非法 JSON → 同为 Anthropic 结构。
+#[tokio::test]
+async fn anthropic_invalid_json_is_anthropic_shaped() {
+    let base = spawn_gateway().await;
+    let r = reqwest::Client::new()
+        .post(format!("{base}/v1/messages"))
+        .header("content-type", "application/json")
+        .body("not json at all")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 400, "实际 {}", r.status());
+    let v: serde_json::Value = r.json().await.unwrap();
+    assert_eq!(v["type"], "error", "{v}");
+}
+
+/// OpenAI 端点畸形请求体 → 必须是 OpenAI 错误结构（非 422 纯文本）。
+#[tokio::test]
+async fn openai_malformed_body_is_openai_shaped() {
+    let base = spawn_gateway().await;
+    let r = reqwest::Client::new()
+        .post(format!("{base}/v1/chat/completions"))
+        .header("content-type", "application/json")
+        .body(r#"{"model":"deepseek-es"}"#) // 缺 messages
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 400, "应为 400，实际 {}", r.status());
+    let v: serde_json::Value = r.json().await.unwrap();
+    assert!(v["error"].is_object(), "应为 OpenAI 错误体: {v}");
+    assert!(v.get("type").is_none(), "OpenAI 不应有顶层 type: {v}");
+}
+
+/// Claude Code 常发的额外字段必须被容忍（不因未知字段拒绝）。
+#[tokio::test]
+async fn extra_fields_are_tolerated() {
+    let base = spawn_gateway().await;
+    // Anthropic：metadata / anthropic_version / tools:[] / system 数组
+    let r = reqwest::Client::new()
+        .post(format!("{base}/v1/messages"))
+        .json(&serde_json::json!({
+            "model":"deepseek-es","max_tokens":50,
+            "system":[{"type":"text","text":"sys"}],
+            "messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}],
+            "tools":[],
+            "metadata":{"user_id":"x"},
+            "anthropic_version":"2023-06-01"
+        }))
+        .send()
+        .await
+        .unwrap();
+    // 应通过解析（可能因上游失败返回 502，但绝不应是 400/422 参数错误）
+    assert_ne!(r.status(), 400, "额外字段不应导致 400");
+    assert_ne!(r.status(), 422, "额外字段不应导致 422");
+}

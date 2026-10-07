@@ -2,6 +2,34 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/) 与 [语义化版本](https://semver.org/)。
 
+## [0.9.0] - 2026-10-07
+
+**契约防坑 + 交付物完善**：修复一个会让真实 SDK 解析失败的契约缺陷；新增变更报告、项目 skill、SOP/ADR、验证记录。
+
+### Fixed
+- **HIGH · 请求体反序列化失败返回 422 纯文本（契约缺陷）**：
+  `/v1/messages`、`/v1/messages/count_tokens`、`/v1/chat/completions` 原用 axum 的
+  `Json<T>` 提取器。当请求体缺字段（如 `messages`）或非法 JSON 时，axum 在**进入 handler 之前**
+  就返回 **422 + 纯文本**（`Failed to deserialize the JSON body...`），**绕过了** H3 引入的
+  `into_anthropic_response()`。真实客户端（Claude Code / OpenAI SDK / Anthropic SDK）解析该纯文本会失败。
+  修复：改为接收 `axum::body::Bytes` 手动解析，失败时返回**协议原生错误结构**
+  （OpenAI `{"error":{...}}` / Anthropic `{"type":"error","error":{...}}`），HTTP 400。
+  新增测试：`anthropic_malformed_body_is_anthropic_shaped`、`anthropic_invalid_json_is_anthropic_shaped`、
+  `openai_malformed_body_is_openai_shaped`、`extra_fields_are_tolerated`。
+
+### Added（交付物）
+- `docs/CHANGE-REPORT.html`：v0.4.0→v0.9.0 变更报告（含 5 题验证测验，可自动判分）。
+- `.claude/skills/add-endpoint/SKILL.md`：新增端点/功能的完整工作流（读记忆→判断过时→契约铁则→TDD→E2E→文档同步）。
+- `docs/SOP-AND-ADR.md`：运维标准作业流程 + 6 条架构决策记录（ADR-001..006）。
+- `VERIFICATION_LOG.md`：验证记录与「已优化项」表（避免重复优化同一处）。
+- `workflow_status.md`：本轮终局审计的任务契约与进度。
+
+### Verified
+- `cargo test --all`：**135 单测 + 46 集成全绿**（较 v0.8.0 新增 4 集成）；fmt / clippy 干净。
+- 契约边界实测：畸形请求体 → 协议原生错误结构（非 422 纯文本）。
+
+---
+
 ## [0.8.0] - 2026-10-07
 
 **新端点 + 流式配额修复 + 仓库瘦身**（v1.5.0 收尾）：新增 `/v1/balance` 与 `/v1/conversations`；

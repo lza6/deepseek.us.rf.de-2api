@@ -186,10 +186,28 @@ async fn list_models(
 
 // ── OpenAI /v1/chat/completions ─────────────────────────
 
+/// OpenAI 端点入口：手动解析请求体，保证**反序列化失败**也返回 OpenAI 错误结构
+/// （而非 axum `Json` 提取器的 422 + 纯文本——SDK 无法解析）。
 async fn openai_chat(
     State(state): State<SharedState>,
     headers: HeaderMap,
-    Json(req): Json<oai::ChatRequest>,
+    body: axum::body::Bytes,
+) -> Response {
+    let req: oai::ChatRequest = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(e) => {
+            return AppError::BadRequest(format!("请求体解析失败: {e}")).into_response();
+        }
+    };
+    openai_chat_inner(state, headers, req)
+        .await
+        .unwrap_or_else(|e| e.into_response())
+}
+
+async fn openai_chat_inner(
+    state: SharedState,
+    headers: HeaderMap,
+    req: oai::ChatRequest,
 ) -> AppResult<Response> {
     check_auth(&state.cfg, &headers)?;
     let t0 = Instant::now();
@@ -757,11 +775,22 @@ async fn start_stream_once(
 
 /// H3：Anthropic 端点对外错误必须是 Anthropic 结构（顶层 `type:"error"`）。
 /// 内部逻辑返回 `AppResult`，此处统一转换为 Anthropic 兼容响应体。
+///
+/// **契约防坑**：直接接收原始 `Bytes` 而非 `Json<MessagesRequest>`——
+/// 否则请求体**反序列化失败**时（如缺 `messages` 字段），axum 的 `Json` 提取器
+/// 会返回 **422 + 纯文本**（`Failed to deserialize...`），绕过 Anthropic 错误结构，
+/// 导致 Claude Code / Anthropic SDK 解析失败。手动解析可保证所有错误都是 Anthropic 结构。
 async fn anthropic_messages(
     State(state): State<SharedState>,
     headers: HeaderMap,
-    Json(req): Json<anth::MessagesRequest>,
+    body: axum::body::Bytes,
 ) -> Response {
+    let req: anth::MessagesRequest = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(e) => {
+            return AppError::BadRequest(format!("请求体解析失败: {e}")).into_anthropic_response()
+        }
+    };
     anthropic_messages_inner(state, headers, req)
         .await
         .unwrap_or_else(|e| e.into_anthropic_response())
@@ -1167,8 +1196,14 @@ fn sse_named<T: serde::Serialize>(name: &str, payload: &T) -> Event {
 async fn count_tokens(
     State(state): State<SharedState>,
     headers: HeaderMap,
-    Json(req): Json<anth::MessagesRequest>,
+    body: axum::body::Bytes,
 ) -> Response {
+    let req: anth::MessagesRequest = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(e) => {
+            return AppError::BadRequest(format!("请求体解析失败: {e}")).into_anthropic_response()
+        }
+    };
     count_tokens_inner(state, headers, req)
         .await
         .unwrap_or_else(|e| e.into_anthropic_response())
