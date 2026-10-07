@@ -80,6 +80,16 @@ pub fn build_router(state: SharedState) -> Router {
         ))
         .with_state(state.clone());
 
+    // §6.6：`/admin` 独立限流——防本地/内网暴力破解 `admin_token`。
+    // 与业务限流分离（业务限流不覆盖 /admin，此处单独加一层更严格的）。
+    if state.cfg.admin_enabled {
+        let admin_rl = RateLimiter::new(state.cfg.admin_rate_limit_per_sec.max(1));
+        router = router.layer(axum::middleware::from_fn_with_state(
+            admin_rl,
+            admin_rate_limit_mw,
+        ));
+    }
+
     if !state.cfg.cors_allow_origins.is_empty() {
         use tower_http::cors::{Any, CorsLayer};
         let origins: Vec<axum::http::HeaderValue> = state
@@ -139,6 +149,19 @@ async fn rate_limit_mw(State(rl): State<RateLimiter>, req: Request, next: Next) 
                     "code": "rate_limit_error",
                 }
             })),
+        )
+            .into_response();
+    }
+    next.run(req).await
+}
+
+/// §6.6：`/admin` 专用限流中间件（防 token 暴力破解）。
+async fn admin_rate_limit_mw(State(rl): State<RateLimiter>, req: Request, next: Next) -> Response {
+    if !rl.allow() {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            [(axum::http::header::CONTENT_TYPE, "text/plain")],
+            "控制台限流：请求过于频繁",
         )
             .into_response();
     }

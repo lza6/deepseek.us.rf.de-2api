@@ -67,6 +67,9 @@ fn default_cache_max() -> usize {
 fn default_admin_token() -> String {
     String::new()
 }
+fn default_admin_rate_limit() -> u64 {
+    10
+}
 fn default_ledger_path() -> String {
     "usage.db".into()
 }
@@ -152,6 +155,9 @@ pub struct Config {
     /// 控制台访问令牌（空 = 未设置，控制台拒绝访问并提示）
     #[serde(default = "default_admin_token")]
     pub admin_token: String,
+    /// §6.6：控制台独立限流（每秒请求数，默认 10），防 token 暴力破解。
+    #[serde(default = "default_admin_rate_limit")]
+    pub admin_rate_limit_per_sec: u64,
     /// 请求级响应缓存：TTL 秒（0=关闭）
     #[serde(default = "default_cache_ttl")]
     pub cache_ttl_secs: u64,
@@ -209,6 +215,7 @@ impl Default for Config {
             rate_limit_per_sec: default_rate_limit(),
             admin_enabled: false,
             admin_token: default_admin_token(),
+            admin_rate_limit_per_sec: default_admin_rate_limit(),
             cache_ttl_secs: default_cache_ttl(),
             cache_max_entries: default_cache_max(),
             cache_min_chars: 0,

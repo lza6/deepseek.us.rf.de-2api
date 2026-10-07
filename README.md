@@ -166,6 +166,7 @@ claude
 | `rate_limit_per_sec` | `0` | 端点每秒限流（0 = 不限，固定窗口，全局共享；位于鉴权之前，未鉴权请求同样计数） |
 | `admin_enabled` | `false` | 启用控制台 |
 | `admin_token` | `""` | 控制台访问令牌（启用时必填） |
+| `admin_rate_limit_per_sec` | `10` | 控制台独立限流（防 token 暴力破解） |
 | `cache_ttl_secs` | `300` | 响应缓存 TTL（0 = 关闭） |
 | `cache_max_entries` | `1000` | 响应缓存最大条目 |
 | `cache_min_chars` | `0` | 低于该长度的结果不缓存 |

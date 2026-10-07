@@ -2345,3 +2345,41 @@ async fn admin_status_exposes_runtime_state() {
     assert_eq!(v["config"]["ledger_retention_days"], 30, "{v}");
     assert!(v["config"]["max_request_bytes"].is_number(), "{v}");
 }
+
+// ── §6.6：/admin 独立限流（防 token 暴力破解） ─────────────────
+
+#[tokio::test]
+async fn admin_rate_limited() {
+    let solver = spawn_mock_solver().await;
+    let cfg = deepseek_es_2api::Config {
+        upstream_base_url: spawn_mock_upstream().await,
+        cf_solver_url: solver,
+        solver_timeout_secs: 10,
+        admin_enabled: true,
+        admin_token: "tok".into(),
+        admin_rate_limit_per_sec: 2, // 每秒 2 次
+        ..Default::default()
+    };
+    let state = make_state(cfg);
+    let app = deepseek_es_2api::api::build_router(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let base = format!("http://{}", addr);
+    let client = reqwest::Client::new();
+    // 连续 6 次（远超 2/s）→ 至少一次 429
+    let mut got_429 = false;
+    for _ in 0..6 {
+        let r = client
+            .get(format!("{base}/admin?token=wrong"))
+            .send()
+            .await
+            .unwrap();
+        if r.status() == 429 {
+            got_429 = true;
+        }
+    }
+    assert!(got_429, "连续请求应触发 /admin 限流");
+}
