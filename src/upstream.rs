@@ -62,15 +62,6 @@ struct BreakerState {
     probe_in_flight: bool,
 }
 
-fn decode_entities(s: &str) -> String {
-    s.replace("&#038;", "&")
-        .replace("&amp;", "&")
-        .replace("&#039;", "'")
-        .replace("&quot;", "\"")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-}
-
 impl UpstreamClient {
     pub fn new(cfg: Config) -> AppResult<Self> {
         let connect = Duration::from_secs(cfg.connect_timeout_secs);
@@ -110,10 +101,6 @@ impl UpstreamClient {
             http_stream,
             solver,
         })
-    }
-
-    pub fn config(&self) -> &Config {
-        &self.cfg
     }
 
     /// 求解器健康快照（供控制台）。
@@ -216,8 +203,8 @@ impl UpstreamClient {
             .any(|(k, v)| k == "dsts_ok" && v == "1")
     }
 
-    /// 从页面 HTML 提取 data-config（含 botId/nonce/provider）。
-    pub async fn fetch_page_config(&self) -> AppResult<PageConfig> {
+    /// 抓取首页 HTML（余额解析的公共入口）。
+    async fn fetch_home_html(&self) -> AppResult<String> {
         let url = format!("{}/", self.cfg.upstream_base_url.trim_end_matches('/'));
         let r = self
             .http
@@ -226,11 +213,163 @@ impl UpstreamClient {
             .send()
             .await
             .map_err(|e| AppError::Network(format!("抓取首页失败: {e}")))?;
-        let html = r
-            .text()
+        r.text()
             .await
-            .map_err(|e| AppError::Network(format!("读取首页失败: {e}")))?;
-        parse_page_config(&html)
+            .map_err(|e| AppError::Network(format!("读取首页失败: {e}")))
+    }
+
+    /// 查询 dsgt 余额（`/wp-json/dsgt/v1/balance`）。
+    ///
+    /// 流程：抓首页 → 解析 `dsgtConfig`（restUrl + nonce）→ 带 `X-WP-Nonce` GET `balance?bot_id=`。
+    /// 返回上游原始 JSON（`{balance, free:{remaining}}`）。
+    ///
+    /// **注意**：余额绑定**浏览器身份**（dsts cookie），返回的是**网关身份**的额度，
+    /// 非下游用户余额。用作配额提示是有效的，但不应宣称为"用户余额"。
+    pub async fn fetch_balance(&self) -> AppResult<serde_json::Value> {
+        let st = self.state.lock().await;
+        let bot_id = st.bot_id.clone();
+        drop(st);
+
+        let html = self.fetch_home_html().await?;
+        let dsgt = parse_dsgt_config(&html)?;
+        let base = dsgt.rest_url.trim_end_matches('/');
+        let url = format!("{base}/balance?bot_id={}", urlencode(&bot_id));
+
+        let mut headers = {
+            let st = self.state.lock().await;
+            self.base_headers(&st)
+        };
+        if let Some(n) = &dsgt.nonce {
+            if let Ok(v) = reqwest::header::HeaderValue::from_str(n) {
+                headers.insert("X-WP-Nonce", v);
+            }
+        }
+        let r = self
+            .http
+            .get(&url)
+            .headers(headers)
+            .send()
+            .await
+            .map_err(|e| AppError::Network(format!("查询余额失败: {e}")))?;
+        let status = r.status();
+        let body = r.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(AppError::Upstream(format!(
+                "余额查询 HTTP {status}: {body}"
+            )));
+        }
+        serde_json::from_str(&body)
+            .map_err(|e| AppError::Upstream(format!("解析余额响应失败: {e}, body={body}")))
+    }
+
+    /// 通用 AIPKit admin-ajax 调用（带 nonce，自动吸收 set-cookie）。
+    ///
+    /// 用于会话管理（list/delete）等非流式端点。
+    async fn ajax_call(
+        &self,
+        action: &str,
+        extra: &[(&str, String)],
+    ) -> AppResult<serde_json::Value> {
+        let nonce = self.ensure_nonce().await?;
+        let bot_id = { self.state.lock().await.bot_id.clone() };
+        let url = self.ajax_url();
+        let mut form: Vec<(String, String)> = vec![
+            ("action".to_string(), action.to_string()),
+            ("_ajax_nonce".to_string(), nonce),
+            ("bot_id".to_string(), bot_id),
+        ];
+        for (k, v) in extra {
+            form.push(((*k).to_string(), v.clone()));
+        }
+        let headers = {
+            let st = self.state.lock().await;
+            self.base_headers(&st)
+        };
+        let r = self
+            .http
+            .post(&url)
+            .headers(headers)
+            .form(&form)
+            .send()
+            .await
+            .map_err(|e| AppError::Network(format!("{action} 请求失败: {e}")))?;
+        let status = r.status();
+        let hdrs = r.headers().clone();
+        let body = r.text().await.unwrap_or_default();
+        {
+            let mut st = self.state.lock().await;
+            Self::absorb_set_cookie(&mut st, &hdrs);
+        }
+        if status == reqwest::StatusCode::FORBIDDEN {
+            return Err(AppError::TsRequired);
+        }
+        if !status.is_success() {
+            return Err(AppError::Upstream(format!(
+                "{action} HTTP {status}: {body}"
+            )));
+        }
+        serde_json::from_str(&body)
+            .map_err(|e| AppError::Upstream(format!("解析 {action} 响应失败: {e}, body={body}")))
+    }
+
+    /// 列出会话（`aipkit_get_conversations_list`）。
+    ///
+    /// 兼容上游响应形状：`data.conversations` 或 `data.items`。
+    /// 返回归一化后的列表 `[{id, title}]`。
+    pub async fn list_conversations(&self, session_id: &str) -> AppResult<Vec<serde_json::Value>> {
+        let v = self
+            .ajax_call(
+                "aipkit_get_conversations_list",
+                &[("session_id", session_id.to_string())],
+            )
+            .await?;
+        let data = v.get("data").cloned().unwrap_or(v);
+        let arr = data
+            .get("conversations")
+            .or_else(|| data.get("items"))
+            .and_then(|c| c.as_array())
+            .cloned()
+            .unwrap_or_default();
+        // 归一化：conversation_uuid || uuid || id
+        Ok(arr
+            .into_iter()
+            .map(|c| {
+                let id = c
+                    .get("conversation_uuid")
+                    .or_else(|| c.get("uuid"))
+                    .or_else(|| c.get("id"))
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+                let title = c
+                    .get("title")
+                    .or_else(|| c.get("name"))
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+                serde_json::json!({"id": id, "title": title})
+            })
+            .collect())
+    }
+
+    /// 删除单条会话（`aipkit_delete_single_conversation`）。
+    pub async fn delete_conversation(
+        &self,
+        session_id: &str,
+        conversation_uuid: &str,
+    ) -> AppResult<()> {
+        let v = self
+            .ajax_call(
+                "aipkit_delete_single_conversation",
+                &[
+                    ("session_id", session_id.to_string()),
+                    ("conversation_uuid", conversation_uuid.to_string()),
+                ],
+            )
+            .await?;
+        if v.get("success").and_then(|s| s.as_bool()).unwrap_or(false) {
+            Ok(())
+        } else {
+            Err(AppError::Upstream(format!("删除会话失败: {v}")))
+        }
     }
 
     /// 是否持有有效的 dsts_ok cookie。
@@ -677,32 +816,60 @@ impl UpstreamClient {
     }
 }
 
-/// 页面 data-config（部分字段）。
+/// dsgt 前端配置（余额/订单 REST 所需）。
 #[derive(Debug, Clone, Deserialize)]
-pub struct PageConfig {
-    #[serde(rename = "botId", default)]
-    pub bot_id: Option<serde_json::Value>,
+pub struct DsgtConfig {
+    #[serde(rename = "restUrl")]
+    pub rest_url: String,
     #[serde(default)]
     pub nonce: Option<String>,
-    #[serde(default)]
-    pub provider: Option<String>,
-    #[serde(rename = "postId", default)]
-    pub post_id: Option<serde_json::Value>,
 }
 
-/// 从 HTML 中解析 `data-config='...'`。
-pub fn parse_page_config(html: &str) -> AppResult<PageConfig> {
-    let marker = "data-config='";
-    let start = html
-        .find(marker)
-        .ok_or_else(|| AppError::Upstream("页面未找到 data-config".into()))?;
-    let rest = &html[start + marker.len()..];
-    let end = rest
-        .find('\'')
-        .ok_or_else(|| AppError::Upstream("data-config 未闭合".into()))?;
-    let raw = decode_entities(&rest[..end]);
-    let cfg: PageConfig = serde_json::from_str(&raw)
-        .map_err(|e| AppError::Upstream(format!("解析 data-config 失败: {e}")))?;
+/// 从 HTML 中解析 `dsgtConfig = { ... }`（用于余额查询）。
+///
+/// 页面形如：`dsgtConfig = {"restUrl":"https:\/\/...","nonce":"0c69ef9c1b",...}`。
+/// 用大括号配平提取 JSON（容忍字符串内的转义）。
+pub fn parse_dsgt_config(html: &str) -> AppResult<DsgtConfig> {
+    let key = html
+        .find("dsgtConfig")
+        .ok_or_else(|| AppError::Upstream("页面未找到 dsgtConfig".into()))?;
+    let rest = &html[key..];
+    let brace = rest
+        .find('{')
+        .ok_or_else(|| AppError::Upstream("dsgtConfig 无 JSON 对象".into()))?;
+    let body = &rest[brace..];
+    // 大括号配平（考虑字符串与转义）
+    let mut depth = 0i32;
+    let mut in_str = false;
+    let mut escaped = false;
+    let mut end = None;
+    for (i, ch) in body.char_indices() {
+        if in_str {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_str = false;
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_str = true,
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    end = Some(i + 1);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let end = end.ok_or_else(|| AppError::Upstream("dsgtConfig JSON 未闭合".into()))?;
+    let cfg: DsgtConfig = serde_json::from_str(&body[..end])
+        .map_err(|e| AppError::Upstream(format!("解析 dsgtConfig 失败: {e}")))?;
     Ok(cfg)
 }
 
@@ -929,9 +1096,32 @@ mod tests {
         );
     }
 
+    // ── dsgtConfig 解析（余额端点，批次 C） ──────────────────
+
     #[test]
-    fn decode_entities_amp() {
-        assert_eq!(decode_entities("&#038;"), "&");
+    fn parse_dsgt_config_basic() {
+        let html = r#"<script>var dsgtConfig = {"restUrl":"https:\/\/deepseek.es\/wp-json\/dsgt\/v1\/","nonce":"0c69ef9c1b","mayBuy":true};</script>"#;
+        let c = parse_dsgt_config(html).unwrap();
+        assert!(c.rest_url.contains("dsgt/v1"), "{}", c.rest_url);
+        assert_eq!(c.nonce.as_deref(), Some("0c69ef9c1b"));
+    }
+
+    #[test]
+    fn parse_dsgt_config_nested_and_escapes() {
+        // 含嵌套对象与字符串内花括号/转义，配平必须正确
+        let html = r#"<x>dsgtConfig = {"restUrl":"https://x/y/","i18n":{"a":"{not a brace}","b":"quote\"here"}};</x>"#;
+        let c = parse_dsgt_config(html).unwrap();
+        assert_eq!(c.rest_url, "https://x/y/");
+    }
+
+    #[test]
+    fn parse_dsgt_config_missing_errors() {
+        assert!(parse_dsgt_config("<html>no config</html>").is_err());
+    }
+
+    #[test]
+    fn parse_dsgt_config_unclosed_errors() {
+        assert!(parse_dsgt_config("dsgtConfig = {\"restUrl\":\"x\"").is_err());
     }
 
     // ── H1 回归：多字节 UTF-8 跨 chunk 边界不得损坏 ──────────────

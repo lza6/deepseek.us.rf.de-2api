@@ -90,6 +90,8 @@ claude
 | `/admin` | GET | 控制台 Web UI（需 `admin_enabled` + `admin_token`） |
 | `/admin/api/status` | GET | 控制台数据 JSON |
 | `/v1/responses/{id}` | GET | **断线重放**：回放某次流式响应未收到的事件 |
+| `/v1/balance` | GET | 上游配额/余额（**网关身份**，非用户余额） |
+| `/v1/conversations` | GET / DELETE | 列出 / 删除上游会话（`?id=`；`x-session-id` 头区分会话） |
 
 ### 控制台
 

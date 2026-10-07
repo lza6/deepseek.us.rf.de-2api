@@ -9,6 +9,9 @@
 /抓包验证/probe-cookies.json
 /抓包验证/evidence
 /抓包验证/solve-and-chat-result.json
+# 一次性抓包/探测产物与上游前端的第三方资源（无构建依赖，移出仓库）
+/源代码/
+/抓包验证/
 __pycache__
 *.pyc
 dist

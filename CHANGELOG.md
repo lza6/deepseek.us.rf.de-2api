@@ -2,7 +2,58 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/) 与 [语义化版本](https://semver.org/)。
 
+## [0.8.0] - 2026-10-07
+
+**新端点 + 流式配额修复 + 仓库瘦身**（v1.5.0 收尾）：新增 `/v1/balance` 与 `/v1/conversations`；
+修复 M10（流式配额未映射 429）；清理死代码与残留。
+
+### Added
+- **`GET /v1/balance`**：查询**网关身份**的上游配额/余额。
+  抓首页解析 `dsgtConfig`（restUrl + nonce）→ 带 `X-WP-Nonce` GET `dsgt/v1/balance?bot_id=`。
+  返回上游 `{balance, free:{limit,remaining,used}, ...}` 原样透传。
+  **如实说明**：余额绑定网关的浏览器身份（dsts cookie），**非下游用户余额**，用于配额提示。
+- **`GET /v1/conversations`**：列出上游会话（`aipkit_get_conversations_list`），
+  响应归一化为 `{object:"list", data:[{id,title}]}`（兼容 `conversation_uuid`/`uuid`/`id` 与 `title`/`name`）。
+- **`DELETE /v1/conversations?id=<uuid>`**：删除单条上游会话（`aipkit_delete_single_conversation`）。缺 id → 400。
+- `src/upstream.rs`：`fetch_balance()` / `list_conversations()` / `delete_conversation()` / 通用 `ajax_call()`；
+  `parse_dsgt_config()`（大括号配平提取，容忍转义与嵌套）。
+- 脚本 `scripts/e2e-meta.mjs`。
+
+### Fixed
+- **MEDIUM · 流式请求的配额耗尽返回 200 + 错误帧（M10）**：`start_stream` 探测首事件时，
+  若首事件为 `Quota`，此前会把它作为错误帧写进已开始的 SSE 流（HTTP 200），
+  多数 SDK 不会当作限流。修复：首事件即配额/错误时，**在响应头发出前**
+  返回 `AppError::QuotaExhausted`（429）/ `UpstreamStream`（502）。
+  两协议（OpenAI/Anthropic）流式均受益。新增测试 `streaming_quota_exhausted_returns_429`。
+
+### Removed（死代码与残留清理）
+- 删除死代码链：`UpstreamClient::config()`、`fetch_page_config()`、`parse_page_config()`、
+  `PageConfig`、`decode_entities()`（均**零生产调用点**；`bot_id` 永远取配置，从不从页面刷新）。
+- `Cargo.toml`：移除未使用的 `http`（直接依赖）与 dev-deps `http-body-util` / `tower`；
+  `tower-http` 特性由 `["cors","trace"]` 收窄为 `["cors"]`（无 `TraceLayer`）。
+- **仓库瘦身**：`源代码/`（含上游前端第三方 JS，678K）、`抓包验证/`（一次性探针，449K）
+  **移出 git 追踪**（`git rm --cached`，本地文件保留）并加入 `.gitignore`。共减约 1.1MB。
+  `分析文档/` **保留**（被 `src/models.rs` 引用，有长期价值）。
+
+### Not Applicable（如实说明，不伪造）
+- 上游"能力缺口"经核实**不可落地**：图片输入（`allowImages=false`）、向量库 RAG、
+  `previous_openai_response_id`（provider≠OpenAI）、联网/Google 接地（旗标全 false）。
+  这些 bot 侧未启用，网关无论如何转发参数都不会改变上游行为 → **不实现**。
+- `features.rs`（伪工具，网关本地执行）与 `tools.rs`（协议级工具，客户端执行）
+  是**不同特性**，其 ```tool 围栏解析虽形似但语义不同 → **保留，不合并**（避免耦合两个特性的风险）。
+
+### Verified
+- `cargo test --all`：**135 单测 + 42 集成全绿**（较 v0.7.0 新增 3 单测 + 4 集成）；
+  `cargo fmt --all -- --check` 与 `cargo clippy --all-targets -- -D warnings` 均干净。
+- **真实 E2E**（连真实上游 deepseek.es + cf_solver）：**5/5 通过**——
+  `/v1/balance` 真实返回 `{"balance":0,"free":{"limit":30000,"remaining":30000,"used":0},...}`；
+  `/v1/conversations` 返回 `{"data":[],"object":"list"}`；`DELETE` 缺 id → 400。
+- **压测**：8 并发 × 24 请求 = **100% 成功**。
+
+---
+
 ## [0.7.0] - 2026-10-07
+
 
 **协议级工具调用（v2.0.0 核心能力）**：OpenAI `tools`/`tool_calls` 与 Anthropic
 `tools`/`tool_use`/`tool_result` 全链路支持，流式与非流式、两协议均覆盖。

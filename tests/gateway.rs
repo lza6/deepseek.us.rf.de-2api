@@ -24,8 +24,17 @@ async fn spawn_mock_upstream() -> String {
     format!("http://{}", addr)
 }
 
-async fn mock_home() -> impl IntoResponse {
-    "<div data-config='{\"botId\":27623,\"provider\":\"DeepSeek\"}'></div>"
+async fn mock_home(headers: axum::http::HeaderMap) -> impl IntoResponse {
+    // dsgtConfig 的 restUrl 用请求的 Host 拼出（供 /v1/balance 解析）。
+    let host = headers
+        .get("host")
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or("127.0.0.1");
+    let url = format!("http://{host}/wp-json/dsgt/v1/");
+    format!(
+        "<div data-config='{{\"botId\":27623,\"provider\":\"DeepSeek\"}}'></div>\
+         <script>var dsgtConfig = {{\"restUrl\":\"{url}\",\"nonce\":\"testnonce\"}};</script>"
+    )
 }
 
 #[derive(serde::Deserialize)]
@@ -610,6 +619,53 @@ async fn quota_exhausted_returns_429() {
     assert_eq!(r.status(), 429, "配额耗尽应映射 429");
     let v: serde_json::Value = r.json().await.unwrap();
     assert_eq!(v["error"]["type"], "rate_limit_error");
+}
+
+/// M10：**流式**请求的配额耗尽也必须返回 HTTP 429（而非 200 + 错误帧）。
+#[tokio::test]
+async fn streaming_quota_exhausted_returns_429() {
+    let base = serve_gateway(
+        spawn_mock_upstream_quota().await,
+        spawn_mock_solver().await,
+        |_| {},
+    )
+    .await;
+    // OpenAI 流式
+    let r = reqwest::Client::new()
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&serde_json::json!({
+            "model": "deepseek-es",
+            "messages": [{"role":"user","content":"hi"}],
+            "stream": true
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        r.status(),
+        429,
+        "流式配额耗尽应返回 429，实际 {}",
+        r.status()
+    );
+    let v: serde_json::Value = r.json().await.unwrap();
+    assert_eq!(v["error"]["type"], "rate_limit_error", "{v}");
+
+    // Anthropic 流式
+    let r2 = reqwest::Client::new()
+        .post(format!("{base}/v1/messages"))
+        .json(&serde_json::json!({
+            "model": "deepseek-es", "max_tokens": 100,
+            "messages": [{"role":"user","content":"hi"}],
+            "stream": true
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r2.status(), 429, "Anthropic 流式配额耗尽应 429");
+    // H3：Anthropic 错误体结构
+    let v2: serde_json::Value = r2.json().await.unwrap();
+    assert_eq!(v2["type"], "error", "{v2}");
+    assert_eq!(v2["error"]["type"], "rate_limit_error", "{v2}");
 }
 
 // ── P1-5：求解重试 ───────────────────────────────────────
@@ -1790,4 +1846,116 @@ async fn no_tools_unchanged_behavior() {
     // 无 tools：恒 "stop"，无 tool_calls 字段
     assert_eq!(v["choices"][0]["finish_reason"], "stop", "{v}");
     assert!(v["choices"][0]["message"]["tool_calls"].is_null(), "{v}");
+}
+
+// ── v0.8.0：余额查询 + 会话管理 ─────────────────────────────
+
+/// mock 上游：支持余额 REST + 会话管理 action。
+async fn spawn_mock_upstream_meta() -> String {
+    #[derive(serde::Deserialize)]
+    struct F {
+        #[serde(default)]
+        action: String,
+        #[serde(default)]
+        #[allow(dead_code)]
+        session_id: String,
+        #[serde(default)]
+        #[allow(dead_code)]
+        conversation_uuid: String,
+    }
+    let app = Router::new()
+        .route("/", get(mock_home))
+        .route(
+            "/wp-json/dsgt/v1/balance",
+            get(|| async {
+                Json(serde_json::json!({"balance": 42, "free": {"remaining": 7}}))
+            }),
+        )
+        .route(
+            "/wp-admin/admin-ajax.php",
+            post(move |axum::extract::Form(f): axum::extract::Form<F>| async move {
+                match f.action.as_str() {
+                    "aipkit_get_frontend_chat_nonce" => (
+                        axum::http::StatusCode::OK,
+                        axum::http::HeaderMap::new(),
+                        r#"{"success":true,"data":{"nonce":"n"}}"#.to_string(),
+                    ),
+                    "aipkit_get_conversations_list" => (
+                        axum::http::StatusCode::OK,
+                        axum::http::HeaderMap::new(),
+                        r#"{"success":true,"data":{"conversations":[{"conversation_uuid":"cv-1","title":"第一条"},{"uuid":"cv-2","name":"第二条"}]}}"#.to_string(),
+                    ),
+                    "aipkit_delete_single_conversation" => (
+                        axum::http::StatusCode::OK,
+                        axum::http::HeaderMap::new(),
+                        r#"{"success":true}"#.to_string(),
+                    ),
+                    _ => (
+                        axum::http::StatusCode::OK,
+                        axum::http::HeaderMap::new(),
+                        r#"{"success":false}"#.to_string(),
+                    ),
+                }
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    format!("http://{}", addr)
+}
+
+#[tokio::test]
+async fn balance_endpoint_returns_upstream_quota() {
+    let base = spawn_gateway_with(spawn_mock_upstream_meta().await).await;
+    let v: serde_json::Value = reqwest::get(format!("{base}/v1/balance"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(v["balance"], 42, "{v}");
+    assert_eq!(v["free"]["remaining"], 7, "{v}");
+}
+
+#[tokio::test]
+async fn conversations_list_normalized() {
+    let base = spawn_gateway_with(spawn_mock_upstream_meta().await).await;
+    let v: serde_json::Value = reqwest::get(format!("{base}/v1/conversations"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(v["object"], "list", "{v}");
+    let arr = v["data"].as_array().unwrap();
+    assert_eq!(arr.len(), 2, "{v}");
+    // 归一化：conversation_uuid || uuid → id
+    assert_eq!(arr[0]["id"], "cv-1", "{v}");
+    assert_eq!(arr[1]["id"], "cv-2", "{v}");
+    assert_eq!(arr[0]["title"], "第一条", "{v}");
+}
+
+#[tokio::test]
+async fn conversation_delete_requires_id() {
+    let base = spawn_gateway_with(spawn_mock_upstream_meta().await).await;
+    // 缺 id → 400
+    let r = reqwest::Client::new()
+        .delete(format!("{base}/v1/conversations"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 400, "缺 id 应 400");
+
+    // 带 id → 成功
+    let r2 = reqwest::Client::new()
+        .delete(format!("{base}/v1/conversations?id=cv-1"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r2.status(), 200, "{}", r2.status());
+    let v: serde_json::Value = r2.json().await.unwrap();
+    assert_eq!(v["ok"], true, "{v}");
+    assert_eq!(v["deleted"], "cv-1", "{v}");
 }

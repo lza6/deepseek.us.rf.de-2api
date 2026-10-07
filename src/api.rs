@@ -46,7 +46,14 @@ pub fn build_router(state: SharedState) -> Router {
         .route("/v1/messages", post(anthropic_messages))
         .route("/v1/messages/count_tokens", post(count_tokens))
         // P3-5：断线重放（配合流式响应的 x-response-id）
-        .route("/v1/responses/{id}", get(replay_response));
+        .route("/v1/responses/{id}", get(replay_response))
+        // v0.8.0：上游配额/余额（网关身份）
+        .route("/v1/balance", get(balance))
+        // v0.8.0：会话管理（列出/删除上游会话）
+        .route(
+            "/v1/conversations",
+            get(list_conversations).delete(delete_conversation),
+        );
 
     if state.cfg.rate_limit_per_sec > 0 {
         let rl = RateLimiter::new(state.cfg.rate_limit_per_sec);
@@ -564,8 +571,66 @@ fn chat_completion(model: &str, content: String, prompt: &str) -> oai::ChatCompl
     }
 }
 
-// ── 断线重放（P3-5）─────────────────────────────────────
+// ── 上游余额（v0.8.0）─────────────────────────────────────
 
+/// `GET /v1/balance`：查询**网关身份**的上游配额/余额。
+///
+/// 返回上游 `{balance, free:{remaining}}` 原样透传。
+/// **注意**：余额绑定网关的浏览器身份（dsts cookie），非下游用户余额。
+async fn balance(State(state): State<SharedState>, headers: HeaderMap) -> Response {
+    if let Err(e) = check_auth(&state.cfg, &headers) {
+        return e.into_response();
+    }
+    match state.upstream.fetch_balance().await {
+        Ok(v) => Json(v).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+// ── 会话管理（v0.8.0）─────────────────────────────────────
+
+/// 从请求头取会话 id（`x-session-id`），缺省用网关默认身份。
+fn session_id_of(headers: &HeaderMap) -> String {
+    headers
+        .get("x-session-id")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "gateway".to_string())
+}
+
+/// `GET /v1/conversations`：列出上游会话（`?session_id=` 或 `x-session-id` 头）。
+async fn list_conversations(State(state): State<SharedState>, headers: HeaderMap) -> Response {
+    if let Err(e) = check_auth(&state.cfg, &headers) {
+        return e.into_response();
+    }
+    let sid = session_id_of(&headers);
+    match state.upstream.list_conversations(&sid).await {
+        Ok(list) => Json(serde_json::json!({"object":"list","data":list})).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+/// `DELETE /v1/conversations?id=<uuid>`：删除单条上游会话。
+async fn delete_conversation(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    Query(q): Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    if let Err(e) = check_auth(&state.cfg, &headers) {
+        return e.into_response();
+    }
+    let Some(id) = q.get("id").filter(|s| !s.is_empty()) else {
+        return AppError::BadRequest("缺少 id 查询参数".into()).into_response();
+    };
+    let sid = session_id_of(&headers);
+    match state.upstream.delete_conversation(&sid, id).await {
+        Ok(()) => Json(serde_json::json!({"ok": true,"deleted": id})).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+// ── 断线重放（P3-5）─────────────────────────────────────
 /// `GET /v1/responses/{id}`：重放某次流式响应中、`Last-Event-ID` 之后的事件。
 ///
 /// - 响应 id 来自流式响应的 `x-response-id` 头。
@@ -624,6 +689,11 @@ type TranslatedStream =
 /// `Translated::TsRequired`）。此时尚未向下游输出任何内容，
 /// 故可安全地强制重认证后**重试一次**。中途（已输出后）再遇该信号则不重试，
 /// 交由下游错误帧处理，避免重复输出。
+///
+/// **M10**：首事件若为 `Quota`（配额耗尽），此时响应头**尚未发出**，
+/// 可提前返回 `AppError::QuotaExhausted`，使流式请求也得到正确的 **HTTP 429**
+/// （而非「200 + 错误帧」——后者多数 SDK 不会当作限流处理）。
+/// 首事件若为普通 `Error`，同样提前失败（避免「200 + 错误帧」）。
 async fn start_stream(
     state: &SharedState,
     prompt: &str,
@@ -633,13 +703,28 @@ async fn start_stream(
 ) -> AppResult<(TranslatedStream, String)> {
     let (mut stream, id) = start_stream_once(state, prompt, conv_uuid).await?;
 
-    // 探测首个事件，判断是否需要安全校验重试。
-    let first = stream.next().await;
-    if let Some(Ok(oai::Translated::TsRequired)) = first {
-        tracing::warn!("上游要求重新安全校验，强制重认证后重试");
-        state.upstream.force_reauth().await?;
-        let (stream2, id2) = start_stream_once(state, prompt, conv_uuid).await?;
-        return Ok((stream2, id2));
+    // 探测首个事件：安全校验重试 / 配额 / 错误。
+    let mut first = stream.next().await;
+    // 对需要提前失败/重试的首事件做处理（用 take 取出，避免 Clone）。
+    match first.take() {
+        Some(Ok(oai::Translated::TsRequired)) => {
+            tracing::warn!("上游要求重新安全校验，强制重认证后重试");
+            state.upstream.force_reauth().await?;
+            let (stream2, id2) = start_stream_once(state, prompt, conv_uuid).await?;
+            return Ok((stream2, id2));
+        }
+        // M10：首事件即配额耗尽 → 提前返回 429（响应头尚未发出）
+        Some(Ok(oai::Translated::Quota(m))) => {
+            tracing::warn!("上游首事件即配额耗尽，返回 429");
+            return Err(AppError::QuotaExhausted(m));
+        }
+        // 首事件即上游错误 → 提前失败（结构化，不泄漏内部细节）
+        Some(Ok(oai::Translated::Error(e))) => {
+            return Err(AppError::UpstreamStream(e));
+        }
+        Some(Err(e)) => return Err(e),
+        // 其余（Delta/Done）或流为空：放回流首
+        other => first = other,
     }
     // 无需重试：把已探测的事件拼回流首，保持原顺序。
     let head = futures::stream::iter(first);
