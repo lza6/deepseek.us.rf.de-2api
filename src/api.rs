@@ -73,6 +73,11 @@ pub fn build_router(state: SharedState) -> Router {
         .route("/admin", get(crate::admin::admin_page))
         .route("/admin/api/status", get(crate::admin::admin_status))
         .merge(api)
+        // 请求体上限：axum 默认 2MB 对长上下文客户端（Claude Code 的 history + tools schema）
+        // 偏小，且超限时返回**纯文本 413**（SDK 无法解析）。改为可配置，且在边界内返回协议错误。
+        .layer(axum::extract::DefaultBodyLimit::max(
+            state.cfg.max_request_bytes,
+        ))
         .with_state(state.clone());
 
     if !state.cfg.cors_allow_origins.is_empty() {

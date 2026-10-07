@@ -53,3 +53,22 @@ node scripts/loadtest.mjs 8 24            # 压测
 ## 变更历史
 
 - 2026-10-07：建立本文件（v0.9.0 终局审计时）。
+
+## 反思发现的真实缺陷（v0.10.0 修复）
+
+> 由 `/reflexion:reflect` 自查发现——**我此前把 v0.8.0 的 E2E 结果当作 v0.9.0 的**，
+> 且漏了两个真实工程缺陷。
+
+| 缺陷 | 证据 | 修复 |
+|------|------|------|
+| **R1 假称 E2E**：v0.9.0 报告写"真实 E2E 5/5"，但 `e2e-meta-config.json` 时间戳 17:38（v0.8.0），`api.rs` 20:22 才改 | `ls -la` vs `git log` | 对最终二进制重跑 5/5 + 8/8 |
+| **R2 413 纯文本**：body 超限返回 `Failed to buffer the request body`（纯文本，SDK 解析失败），且 axum 默认 2MB 对长上下文偏小 | 实测 `3MB → 413 纯文本` | 新增 `max_request_bytes`（默认 8MB） |
+| **R3 账本无限增长**：`usage.db-wal` 2.9MB，无 retention/checkpoint | `ls` + grep 无 `DELETE FROM` | 新增 `prune()` + `wal_autocheckpoint` + 每 6h 后台清理 |
+
+## 反思教训（务必遵守）
+
+1. **E2E 必须针对最终二进制**：改完代码后重跑，不能沿用上一版结果。**先看时间戳**。
+2. **同类 bug 要扫全**：修了"错误体不结构化"，就必须扫**所有**可能返回非结构化错误的地方
+   （Body limit 413、限流中间件、并发限流 503）。
+3. **声称前必须用命令核实**，不能用记忆。
+

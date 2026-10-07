@@ -70,6 +70,9 @@ fn default_admin_token() -> String {
 fn default_ledger_path() -> String {
     "usage.db".into()
 }
+fn default_ledger_retention_days() -> u64 {
+    30
+}
 fn default_solvers() -> Vec<String> {
     vec![]
 }
@@ -78,6 +81,9 @@ fn default_language_prompt() -> String {
 }
 fn default_cache_max_bytes() -> usize {
     2 * 1024 * 1024
+}
+fn default_max_request_bytes() -> usize {
+    8 * 1024 * 1024
 }
 
 /// 顶层配置。
@@ -158,6 +164,9 @@ pub struct Config {
     /// 用量账本：SQLite 路径（空 = 关闭持久化）
     #[serde(default = "default_ledger_path")]
     pub ledger_path: String,
+    /// 用量账本保留天数（0 = 不清理）。生产长期运行须设，避免 DB 无限增长。
+    #[serde(default = "default_ledger_retention_days")]
+    pub ledger_retention_days: u64,
     /// 多 cf_solver 实例（空 = 使用 `cf_solver_url` 单实例）
     #[serde(default = "default_solvers")]
     pub solver_urls: Vec<String>,
@@ -167,6 +176,10 @@ pub struct Config {
     /// 非流式聚合输出上限（字节；超限返回错误，防上游超大响应）
     #[serde(default = "default_cache_max_bytes")]
     pub max_response_bytes: usize,
+    /// 请求体上限（字节）。默认 8MB——长上下文客户端（Claude Code history + tools schema）
+    /// 可能超 axum 默认的 2MB。超限返回 413。
+    #[serde(default = "default_max_request_bytes")]
+    pub max_request_bytes: usize,
     /// 伪工具调用开关（H4）：启用后在 prompt 注入工具说明，使模型知晓可发 ` ```tool ` 块
     #[serde(default = "default_false")]
     pub pseudo_tools_enabled: bool,
@@ -200,10 +213,12 @@ impl Default for Config {
             cache_max_entries: default_cache_max(),
             cache_min_chars: 0,
             ledger_path: default_ledger_path(),
+            ledger_retention_days: default_ledger_retention_days(),
             solver_urls: default_solvers(),
             system_prompt_suffix: default_language_prompt(),
             max_response_bytes: default_cache_max_bytes(),
             pseudo_tools_enabled: false,
+            max_request_bytes: default_max_request_bytes(),
         }
     }
 }

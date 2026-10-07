@@ -2,6 +2,46 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/) 与 [语义化版本](https://semver.org/)。
 
+## [0.10.0] - 2026-10-07
+
+**反思自审发现的真实缺陷修复**（`/reflexion:reflect` 触发）。三项：一项**诚实性缺陷**（我自己的），两项真实工程缺陷。
+
+### Fixed
+- **诚实性 · E2E 结果被误报（R1）**：v0.9.0 报告声称「真实 E2E 5/5」，但核实时间戳发现——
+  E2E 配置来自 **17:38**（v0.8.0），而契约修复在 **20:22** 才提交。
+  **该修复从未经过真实 E2E 验证**，我却宣称完成。
+  修复：对最终二进制（21:33 构建）**重跑** E2E → `e2e-meta` 5/5 + `e2e-v1` 8/8 真实通过。
+- **HIGH · 请求体超限返回纯文本 413（R2）**：axum 默认 body 限制 2MB 超限时返回
+  `Failed to buffer the request body`（**纯文本**，与 v0.9.0 修的契约缺陷**同类**——
+  SDK 无法解析）；且 2MB 对长上下文客户端（Claude Code 的 history + tools schema）偏小。
+  修复：新增配置 `max_request_bytes`（默认 **8MB**），显式 `DefaultBodyLimit`。
+  测试：`oversized_body_rejected_with_413`、`body_within_configured_limit_accepted`。
+- **MEDIUM · 账本无限增长（R3）**：`usage.db` 只 INSERT 无清理，实测 `-wal` 已达 **2.9MB**，
+  长期运行磁盘无界增长、聚合查询变慢。
+  修复：新增 `Ledger::prune(retention_days)`（+ `PRAGMA wal_autocheckpoint` 折叠 WAL），
+  新增配置 `ledger_retention_days`（默认 **30**），`main.rs` 每 6h 后台清理。
+  测试：`prune_removes_old_records_only`、`prune_zero_days_is_noop`、`prune_on_memory_ledger_is_noop`。
+
+### Fixed（文档一致性）
+- `README.md`：测试数 `46` → `186`；「内置 Turnstile 求解」→「对接外部 cf_solver」；
+  补 4 个缺失配置项（`user_agent`/`default_model`/`solver_timeout_secs`/`http_timeout_secs`）
+  与新配置；环境变量补 `USER_AGENT`。
+- `docs/DEPLOY.md`：Rust 版本 `1.87` → `1.89`；健康检查示例版本 `0.1.0` → `0.9.0`；
+  删除对不存在文件 `Dockerfile.cfsolver` 的引用。
+
+### Verified
+- `cargo test --all`：**138 单测 + 48 集成全绿**（较 v0.9.0 新增 3 单测 + 2 集成）；
+  fmt / clippy 干净。
+- **真实 E2E（对最终二进制）**：`e2e-meta` **5/5** + `e2e-v1` **8/8** 通过。
+- **压测**：8 并发 × 24 = **100%**，p50=2699ms。
+
+### 反思教训（已写入 VERIFICATION_LOG.md）
+1. **E2E 必须针对最终二进制**——不能沿用上一版结果，先核对时间戳。
+2. **同类缺陷要扫全**——修了「非结构化错误体」，须扫所有返回非结构化错误的位置。
+3. **声称前必须用命令核实**，不能用记忆。
+
+---
+
 ## [0.9.0] - 2026-10-07
 
 **契约防坑 + 交付物完善**：修复一个会让真实 SDK 解析失败的契约缺陷；新增变更报告、项目 skill、SOP/ADR、验证记录。

@@ -24,8 +24,10 @@
   "cache_max_entries": 1000,
   "cache_min_chars": 0,
   "ledger_path": "usage.db",
+  "ledger_retention_days": 30,
   "solver_urls": [],
   "system_prompt_suffix": "",
   "max_response_bytes": 2097152,
+  "max_request_bytes": 8388608,
   "pseudo_tools_enabled": false
 }

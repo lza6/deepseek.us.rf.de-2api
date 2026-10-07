@@ -61,6 +61,23 @@ async fn main() -> anyhow::Result<()> {
     if ledger.enabled() {
         tracing::info!("用量账本已启用: {}", cfg.ledger_path);
     }
+    // R3：后台账本清理——按保留期删除旧记录，避免 DB 无限增长、聚合查询变慢。
+    if ledger.enabled() && cfg.ledger_retention_days > 0 {
+        let l = ledger.clone();
+        let days = cfg.ledger_retention_days;
+        tokio::spawn(async move {
+            // 启动时先清一次，之后每 6h 一次
+            let mut ticker = tokio::time::interval(Duration::from_secs(6 * 3600));
+            loop {
+                match l.prune(days).await {
+                    Ok(n) if n > 0 => tracing::info!("账本清理：删除 {n} 条超过 {days} 天的记录"),
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!("账本清理失败: {e}"),
+                }
+                ticker.tick().await;
+            }
+        });
+    }
     let cache = ResponseCache::new(
         cfg.cache_ttl_secs,
         cfg.cache_max_entries,

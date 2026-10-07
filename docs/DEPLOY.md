@@ -4,7 +4,7 @@
 
 | 组件 | 版本 | 用途 |
 |------|------|------|
-| Rust | ≥ 1.87 | 编译网关 |
+| Rust | ≥ 1.89 | 编译网关 |
 | Python | 3.11 | 运行 cf_solver（camoufox） |
 | camoufox | latest | CF Turnstile 浏览器求解 |
 
@@ -78,7 +78,7 @@ export API_KEYS="sk-your-strong-key-1,sk-your-strong-key-2"
 
 ```bash
 curl http://127.0.0.1:47833/healthz
-# {"status":"ok","upstream":"https://deepseek.es","bot_id":"27623","cf_solver":"...","version":"0.1.0"}
+# {"status":"ok","upstream":"https://deepseek.es","bot_id":"27623","cf_solver":"...","version":"0.9.0"}
 ```
 
 日志（`RUST_LOG=info`）关键事件：
@@ -100,7 +100,7 @@ docker run -p 47833:47833 \
 
 > Docker 版**不含 cf_solver**（浏览器依赖重）。生产建议两种方式：
 > 1. 宿主机跑 cf_solver，容器经 `host.docker.internal:8001` 访问；
-> 2. 用 `tools/cf_solver` 的 `Dockerfile.cfsolver`（源自上层项目）单独构建求解器镜像。
+> 2. 自行构建 cf_solver 求解器镜像（本项目 `tools/cf_solver/` 仅含运行脚本，未提供 Dockerfile）。
 
 ## 7. 故障排查
 

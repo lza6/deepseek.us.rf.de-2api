@@ -2035,3 +2035,71 @@ async fn extra_fields_are_tolerated() {
     assert_ne!(r.status(), 400, "额外字段不应导致 400");
     assert_ne!(r.status(), 422, "额外字段不应导致 422");
 }
+
+// ── R2：请求体上限（长上下文客户端不应被过小默认值误拒） ──────────
+
+/// 请求体超过配置上限 → 413（不 panic、不 500）。
+#[tokio::test]
+async fn oversized_body_rejected_with_413() {
+    let solver = spawn_mock_solver().await;
+    let cfg = deepseek_es_2api::Config {
+        upstream_base_url: spawn_mock_upstream().await,
+        cf_solver_url: solver,
+        solver_timeout_secs: 10,
+        max_request_bytes: 1024, // 极小上限便于测试
+        ..Default::default()
+    };
+    let state = make_state(cfg);
+    let app = deepseek_es_2api::api::build_router(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let base = format!("http://{}", addr);
+    let big = "x".repeat(4096);
+    let r = reqwest::Client::new()
+        .post(format!("{base}/v1/chat/completions"))
+        .header("content-type", "application/json")
+        .body(format!(
+            r#"{{"model":"deepseek-es","messages":[{{"role":"user","content":"{big}"}}]}}"#
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 413, "超限应 413，实际 {}", r.status());
+}
+
+/// 请求体在上限内（但超 axum 默认 2MB）不应被误拒 —— 验证 max_request_bytes 生效。
+#[tokio::test]
+async fn body_within_configured_limit_accepted() {
+    let solver = spawn_mock_solver().await;
+    let cfg = deepseek_es_2api::Config {
+        upstream_base_url: spawn_mock_upstream().await,
+        cf_solver_url: solver,
+        solver_timeout_secs: 10,
+        max_request_bytes: 3 * 1024 * 1024, // 3MB > axum 默认 2MB
+        ..Default::default()
+    };
+    let state = make_state(cfg);
+    let app = deepseek_es_2api::api::build_router(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let base = format!("http://{}", addr);
+    // ~2.5MB 正文（超默认 2MB，但在 3MB 上限内）
+    let big = "x".repeat(2_500_000);
+    let r = reqwest::Client::new()
+        .post(format!("{base}/v1/chat/completions"))
+        .header("content-type", "application/json")
+        .body(format!(
+            r#"{{"model":"deepseek-es","messages":[{{"role":"user","content":"{big}"}}]}}"#
+        ))
+        .send()
+        .await
+        .unwrap();
+    // 不应是 413（解析/上游可能失败，但绝不是 body 超限）
+    assert_ne!(r.status(), 413, "2.5MB 在 3MB 上限内不应 413");
+}

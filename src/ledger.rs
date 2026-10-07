@@ -68,6 +68,8 @@ impl Ledger {
             .map_err(|e| AppError::Internal(format!("设置账本忙等待失败: {e}")))?;
         conn.execute_batch(
             "PRAGMA journal_mode=WAL;
+             -- 自动 checkpoint：WAL 超约 4MB 时折叠回主库，避免 -wal 无限增长
+             PRAGMA wal_autocheckpoint=1000;
              CREATE TABLE IF NOT EXISTS usage (
                  id INTEGER PRIMARY KEY AUTOINCREMENT,
                  ts INTEGER NOT NULL,
@@ -86,6 +88,33 @@ impl Ledger {
         Ok(Ledger {
             conn: Some(Arc::new(Mutex::new(conn))),
         })
+    }
+
+    /// 按保留期清理历史记录（`retention_days` 天前）。返回删除行数。
+    ///
+    /// 生产长期运行必须定期调用，否则 `usage.db` 无限增长、聚合查询变慢。
+    /// `retention_days` = 0 → 不清理。
+    pub async fn prune(&self, retention_days: u64) -> AppResult<usize> {
+        if retention_days == 0 {
+            return Ok(0);
+        }
+        let Some(conn) = self.conn.clone() else {
+            return Ok(0);
+        };
+        let cutoff = chrono::Utc::now().timestamp() - (retention_days as i64) * 86_400;
+        tokio::task::spawn_blocking(move || {
+            let c = conn
+                .lock()
+                .map_err(|e| AppError::Internal(format!("账本锁中毒: {e}")))?;
+            let n = c
+                .execute("DELETE FROM usage WHERE ts < ?1", rusqlite::params![cutoff])
+                .map_err(|e| AppError::Internal(format!("账本清理失败: {e}")))?;
+            // 清理后折叠 WAL，回收磁盘
+            let _ = c.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
+            Ok(n)
+        })
+        .await
+        .map_err(|e| AppError::Internal(format!("账本清理任务失败: {e}")))?
     }
 
     /// 是否启用持久化。
@@ -343,5 +372,67 @@ mod tests {
         // 无效路径（目录不存在）→ 降级为内存模式，不返回 Err
         let l = Ledger::open("/nonexistent-dir-xyz/sub/u.db").unwrap();
         assert!(!l.enabled(), "打开失败应降级为内存模式");
+    }
+
+    // ── R3：账本保留期清理（生产长期运行防无限增长） ──────────────
+
+    #[tokio::test]
+    async fn prune_removes_old_records_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("p.db");
+        let l = Ledger::open(path.to_str().unwrap()).unwrap();
+        let now = chrono::Utc::now().timestamp();
+        let old = now - 40 * 86_400; // 40 天前
+                                     // 一条旧记录 + 一条新记录
+        for ts in [old, now] {
+            l.record(UsageRecord {
+                ts,
+                model: "deepseek-es".into(),
+                key_id: "local".into(),
+                prompt_tokens: 1,
+                completion_tokens: 1,
+                latency_ms: 1,
+                status: 200,
+                stream: false,
+                cached: false,
+            })
+            .await;
+        }
+        assert_eq!(l.stats(None).await.unwrap().total_requests, 2);
+        // 保留 30 天 → 删掉 40 天前的那条
+        let n = l.prune(30).await.unwrap();
+        assert_eq!(n, 1, "应删除 1 条旧记录");
+        assert_eq!(
+            l.stats(None).await.unwrap().total_requests,
+            1,
+            "新记录应保留"
+        );
+    }
+
+    #[tokio::test]
+    async fn prune_zero_days_is_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("p0.db");
+        let l = Ledger::open(path.to_str().unwrap()).unwrap();
+        l.record(UsageRecord {
+            ts: 1,
+            model: "m".into(),
+            key_id: "local".into(),
+            prompt_tokens: 1,
+            completion_tokens: 1,
+            latency_ms: 1,
+            status: 200,
+            stream: false,
+            cached: false,
+        })
+        .await;
+        assert_eq!(l.prune(0).await.unwrap(), 0, "0 天 = 不清理");
+        assert_eq!(l.stats(None).await.unwrap().total_requests, 1);
+    }
+
+    #[tokio::test]
+    async fn prune_on_memory_ledger_is_noop() {
+        let l = Ledger::open("").unwrap();
+        assert_eq!(l.prune(30).await.unwrap(), 0);
     }
 }

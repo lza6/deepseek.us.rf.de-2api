@@ -1,7 +1,7 @@
 # deepseek-es-2api
 
 把 [deepseek.es](https://deepseek.es)（WordPress + AIPKit 聊天）转换为 **OpenAI 兼容**（`/v1/chat/completions`）
-与 **Anthropic 兼容**（`/v1/messages`）的 API 网关，内置 **Cloudflare Turnstile 求解**。
+与 **Anthropic 兼容**（`/v1/messages`）的 API 网关，**对接外部 cf_solver 完成 Cloudflare Turnstile 求解**。
 
 > 上游为非标准 SSE 协议，本网关在 Rust 侧完成认证（Turnstile）、会话管理与协议翻译。
 > **已通过真实 E2E 验证**：Turnstile 求解 → 安全 Cookie → SSE 流 → OpenAI/Anthropic 兼容输出。
@@ -151,6 +151,10 @@ claude
 | `cf_solver_url` | `http://127.0.0.1:8001` | 求解器地址 |
 | `api_keys` | `[]` | 下游 Key；空 = 仅本机放行 |
 | `proxy` | `null` | 上游出口代理（如 `http://127.0.0.1:10808`） |
+| `user_agent` | `Chrome/150` | 浏览器 UA（**必须与 cf_solver 一致**，否则 cookie 绑定失败） |
+| `default_model` | `deepseek-es` | 默认模型 id（可自定义，`resolve_model` 据此回退） |
+| `solver_timeout_secs` | `120` | Turnstile 求解超时（秒） |
+| `http_timeout_secs` | `120` | 上游请求空闲读超时（秒；SSE 无总超时，按两次读之间计） |
 | `cookie_ttl_secs` | `1800` | 安全 cookie 缓存 TTL（剩余 20% 时后台预取续期） |
 | `connect_timeout_secs` | `20` | 上游连接建立超时（SSE 流无总超时，仅连接 + 空闲读超时） |
 | `cors_allow_origins` | `[]` | CORS；空 = 关闭 |
@@ -165,12 +169,14 @@ claude
 | `cache_max_entries` | `1000` | 响应缓存最大条目 |
 | `cache_min_chars` | `0` | 低于该长度的结果不缓存 |
 | `ledger_path` | `usage.db` | SQLite 账本路径（空 = 关闭） |
+| `ledger_retention_days` | `30` | 账本保留天数（0 = 不清理）；超期记录每 6h 自动删除 |
 | `solver_urls` | `[]` | 多 cf_solver 地址（空则用 `cf_solver_url`） |
 | `system_prompt_suffix` | `""` | 追加的 system 指令（语言/风格） |
 | `pseudo_tools_enabled` | `false` | 启用伪工具（注入工具说明；模型输出 ` ```tool ` 块 → 本地执行） |
 | `max_response_bytes` | `2097152` | 非流式聚合上限（防超大响应） |
+| `max_request_bytes` | `8388608` | 请求体上限（默认 8MB；长上下文客户端可调大） |
 
-环境变量可覆盖：`LISTEN_ADDR` `UPSTREAM_BASE_URL` `BOT_ID` `SITEKEY` `CF_SOLVER_URL` `API_KEYS` `PROXY` `DEFAULT_MODEL` `CORS_ALLOW_ORIGINS` `HTTP_TIMEOUT_SECS` `CONNECT_TIMEOUT_SECS`
+环境变量可覆盖：`LISTEN_ADDR` `UPSTREAM_BASE_URL` `BOT_ID` `SITEKEY` `CF_SOLVER_URL` `API_KEYS` `PROXY` `DEFAULT_MODEL` `CORS_ALLOW_ORIGINS` `HTTP_TIMEOUT_SECS` `CONNECT_TIMEOUT_SECS` `USER_AGENT`
 
 > **安全**：监听地址为**非回环**（如 `0.0.0.0`）且 `api_keys` 为空时，网关**拒绝启动**（fail-fast）。确需无鉴权暴露公网须显式设置 `ALLOW_INSECURE_PUBLIC=1`（危险）。
 
@@ -193,7 +199,7 @@ claude
 ## 开发与测试
 
 ```bash
-# 单元测试 + 集成测试（mock 上游，46 项）
+# 单元测试 + 集成测试（mock 上游，186 项）
 cargo test
 
 # 格式与静态检查
@@ -210,7 +216,7 @@ node scripts/loadtest.mjs 4 12
 **实测结果**（真实上游）：
 | 指标 | 值 |
 |------|-----|
-| 单测 + 集成 | 46/46 通过 |
+| 单测 + 集成 | 186/186 通过 |
 | E2E OpenAI 流式 | ✅ 真实回复 |
 | E2E Anthropic 流式 | ✅ 事件序列完整 |
 | 压测 8 并发 × 24 请求 | 100% 成功，p50=1.86s，QPS 3.62 |
