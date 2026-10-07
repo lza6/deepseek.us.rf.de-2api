@@ -2,7 +2,63 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/) 与 [语义化版本](https://semver.org/)。
 
+## [0.5.0] - 2026-10-07
+
+**v1.0.0 正确性加固批次收尾**：关闭全部剩余 HIGH（H3/H4）与 M1/M3/M4/M7/M11/M12。
+至此 §2.1 的四项 HIGH **全部闭环**，网关达到「正确性基线」。
+
+### Fixed
+- **HIGH · Anthropic 端点错误体是 OpenAI 结构（H3）**：`errors.rs` 的 `IntoResponse` 是全局唯一的，
+  `/v1/messages` 与 `/v1/messages/count_tokens` 的所有错误（401/400/429/502…）都返回
+  `{"error":{...}}`。Anthropic 规范要求顶层 `{"type":"error","error":{"type":..,"message":..}}`，
+  否则 Claude Code / Anthropic SDK 解析错误失败。
+  修复：新增 `AppError::anthropic_error_type()`（把无对应类型的 `upstream_error`/`network_error`/
+  `internal_error` 收敛为合法的 `api_error`）与 `into_anthropic_response()`；两个 Anthropic 处理器
+  统一经此转换。**OpenAI 端点结构不变**（有回归测试守护）。
+- **HIGH · 伪工具说明从未注入（H4）**：`features::TOOL_INSTRUCTION` 已定义但**全仓零引用**，
+  模型永远收不到使用说明 → 伪工具功能实际不可用。
+  修复：新增 `features::inject_prompt_prefixes()`（语言指令 + 工具说明组合注入），
+  新增配置 `pseudo_tools_enabled`（默认 false，避免改变现有行为）；OpenAI 与 Anthropic 两端均接线。
+  删除已无生产调用点的旧 `inject_system_prompt`（避免新的死代码）。
+- **MEDIUM · 哨兵值 `__TS_REQUIRED__` 泄漏下游（M3）**：翻译层返回字符串哨兵，
+  中途触发或重试失败时原样进入下游 `message` 字段；Anthropic 非流式甚至不特判。
+  修复：新增结构化枚举 `Translated::TsRequired`，全路径（OpenAI/Anthropic × 流式/非流式）
+  统一处理，杜绝哨兵字符串外泄。
+- **MEDIUM · Anthropic 流式 usage 恒为 0/0（M4）**：`message_start`/`message_delta` 硬编码 0。
+  修复：`message_start` 填 `estimate_tokens(prompt)`；`message_delta` 填累积输出估算。
+- **MEDIUM · 上游中途断开时结束信号不完整（M7）**：OpenAI 流无条件追加 `[DONE]` 但缺 `finish_reason`；
+  Anthropic 流断开时无 `message_stop`，客户端视为异常截断。
+  修复：两协议均在流尾检测「未收到 Done」时补发标准结束序列。
+- **MEDIUM · Anthropic 非流式无响应上限（M11）**：`max_response_bytes` 仅约束 OpenAI 非流式。
+  修复：Anthropic 非流式聚合同步加上限保护。
+- **MEDIUM · 未识别上游事件静默丢弃（M12）**：`translate_event` 的 `_ => None` 无任何可观测痕迹。
+  修复：对未知命名事件记 `debug` 日志（保留 `message_start` 静默），便于未来上游新增事件时排查。
+
+### Added
+- 配置项 `pseudo_tools_enabled`（伪工具说明注入开关）。
+- 测试：`anthropic_error_type_only_uses_valid_values`、`translate_unknown_event_ignored_m12`、
+  `tool_instruction_injected_when_enabled`、`tool_instruction_absent_when_disabled`、
+  `language_and_tools_both_injected`、`no_prefixes_is_noop`；
+  集成 `anthropic_error_body_is_anthropic_shaped`、`anthropic_bad_request_is_anthropic_shaped`、
+  `openai_error_body_stays_openai_shaped`、`anthropic_stream_usage_is_nonzero`、
+  `openai_stream_abrupt_close_has_finish_reason`、`anthropic_stream_abrupt_close_has_message_stop`、
+  `anthropic_nonstream_respects_max_response_bytes`、`tool_instruction_reaches_upstream_when_enabled`。
+- 脚本 `scripts/e2e-v1.mjs`（真实 E2E：H3/M4/M7/H4 + OpenAI 回归）。
+
+### Verified
+- `cargo test --all`：**94 单测 + 33 集成全绿**（较 v0.4.0 新增 5 单测 + 8 集成）；
+  `cargo fmt --all -- --check` 与 `cargo clippy --all-targets -- -D warnings` 均干净。
+- **真实 E2E**（连真实上游 deepseek.es + cf_solver）：**8/8 通过**——
+  Anthropic 错误体为 Anthropic 结构；流式 `usage.output_tokens > 0`；正常结束含 `message_stop`；
+  OpenAI 流式中文无 `�` 且含 `finish_reason` + `[DONE]`；
+  **伪工具真实生效**：模型实际输出 ` ```tool ` 块并触发本地执行
+  （`[tool:get_time] {"ok":true,"result":"2026-10-07T03:54:02Z"}`）。
+- **压测**：8 并发 × 24 请求 = **100% 成功**，p50=2019ms、p99=3861ms、QPS 4.07。
+
+---
+
 ## [0.4.0] - 2026-10-07
+
 
 两项 **HIGH 级正确性修复**，均由独立审计发现、经真实 E2E 反证确认、并按 TDD 流程修复。
 其中 H1 是「唯一会造成**静默内容损坏**」的缺陷。

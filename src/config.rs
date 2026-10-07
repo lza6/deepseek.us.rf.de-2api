@@ -161,6 +161,9 @@ pub struct Config {
     /// 非流式聚合输出上限（字节；超限返回错误，防上游超大响应）
     #[serde(default = "default_cache_max_bytes")]
     pub max_response_bytes: usize,
+    /// 伪工具调用开关（H4）：启用后在 prompt 注入工具说明，使模型知晓可发 ` ```tool ` 块
+    #[serde(default = "default_false")]
+    pub pseudo_tools_enabled: bool,
 }
 
 impl Default for Config {
@@ -193,6 +196,7 @@ impl Default for Config {
             solver_urls: default_solvers(),
             system_prompt_suffix: default_language_prompt(),
             max_response_bytes: default_cache_max_bytes(),
+            pseudo_tools_enabled: false,
         }
     }
 }

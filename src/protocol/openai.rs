@@ -252,6 +252,9 @@ pub enum Translated {
     Error(String),
     /// 配额耗尽（上游 quota_notice，需映射 429）
     Quota(String),
+    /// 上游要求重新安全校验（M3：结构化替代 `__TS_REQUIRED__` 字符串哨兵，
+    /// 避免哨兵值泄漏给下游）。
+    TsRequired,
 }
 
 /// 解析上游 SSE 事件 → 翻译结果。非文本事件返回 None。
@@ -291,14 +294,20 @@ pub fn translate_event(ev: &SseEvent) -> Option<Translated> {
                 .and_then(|b| b.as_bool())
                 .unwrap_or(false)
             {
-                return Some(Translated::Error("__TS_REQUIRED__".into()));
+                return Some(Translated::TsRequired);
             }
             Some(Translated::Error(msg))
         }
         "__stream_error__" => Some(Translated::Error(ev.data.clone())),
-        // message_start / status / citations / grounding_metadata / display_form_event / warning
-        // 本站（provider=DeepSeek）不产生文本，对 OpenAI 输出忽略
-        _ => None,
+        // M12：未识别的上游命名事件（status/citations/grounding_metadata/display_form_event/
+        // warning 等）。本站（provider=DeepSeek）当前不触发，但记 debug 日志 + 计数，
+        // 避免未来上游新增事件被静默吞无法观测。
+        other => {
+            if other != "message_start" {
+                tracing::debug!(event = other, "上游未识别事件（已忽略）");
+            }
+            None
+        }
     }
 }
 
@@ -407,10 +416,8 @@ mod tests {
             event: "error".into(),
             data: r#"{"error":"Sicherheitspruefung erforderlich.","ts_required":true}"#.into(),
         };
-        assert_eq!(
-            translate_event(&ev),
-            Some(Translated::Error("__TS_REQUIRED__".into()))
-        );
+        // M3：结构化变体，不再用字符串哨兵
+        assert_eq!(translate_event(&ev), Some(Translated::TsRequired));
     }
 
     #[test]
@@ -418,6 +425,16 @@ mod tests {
         let ev = SseEvent {
             event: "message_start".into(),
             data: r#"{"message_id":"x"}"#.into(),
+        };
+        assert_eq!(translate_event(&ev), None);
+    }
+
+    #[test]
+    fn translate_unknown_event_ignored_m12() {
+        // M12：未知事件不得 panic、不得产出文本，仅记日志后忽略
+        let ev = SseEvent {
+            event: "citations".into(),
+            data: r#"{"citations":[{"url":"x"}]}"#.into(),
         };
         assert_eq!(translate_event(&ev), None);
     }

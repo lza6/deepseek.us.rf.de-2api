@@ -1316,3 +1316,295 @@ async fn mock_sse_multibyte(
     ];
     Sse::new(futures::stream::iter(events))
 }
+
+// ── H3 回归：Anthropic 端点错误体必须是 Anthropic 结构 ────────────
+
+/// Anthropic 端点鉴权失败 → 错误体应为 `{"type":"error","error":{...}}`（非 OpenAI 结构）。
+#[tokio::test]
+async fn anthropic_error_body_is_anthropic_shaped() {
+    let upstream = spawn_mock_upstream().await;
+    let solver = spawn_mock_solver().await;
+    let cfg = deepseek_es_2api::Config {
+        upstream_base_url: upstream,
+        cf_solver_url: solver,
+        solver_timeout_secs: 10,
+        api_keys: vec!["sk-secret".into()],
+        ..Default::default()
+    };
+    let state = make_state(cfg);
+    let app = deepseek_es_2api::api::build_router(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let base = format!("http://{}", addr);
+
+    // 不带 key → 401
+    let r = reqwest::Client::new()
+        .post(format!("{base}/v1/messages"))
+        .json(&serde_json::json!({
+            "model":"deepseek-es","max_tokens":10,
+            "messages":[{"role":"user","content":"hi"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 401);
+    let v: serde_json::Value = r.json().await.unwrap();
+    assert_eq!(v["type"], "error", "缺少顶层 type:error: {v}");
+    assert!(v["error"]["type"].is_string(), "error.type 缺失: {v}");
+    assert!(v["error"]["message"].is_string(), "error.message 缺失: {v}");
+}
+
+/// Anthropic 端点参数错误（缺 messages）→ 也是 Anthropic 结构。
+#[tokio::test]
+async fn anthropic_bad_request_is_anthropic_shaped() {
+    let base = spawn_gateway().await;
+    let r = reqwest::Client::new()
+        .post(format!("{base}/v1/messages"))
+        .json(&serde_json::json!({ "model": "deepseek-es", "max_tokens": 10, "messages": [] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 400);
+    let v: serde_json::Value = r.json().await.unwrap();
+    assert_eq!(v["type"], "error", "缺少顶层 type:error: {v}");
+    assert_eq!(v["error"]["type"], "invalid_request_error", "{v}");
+}
+
+/// OpenAI 端点错误体保持 OpenAI 结构（回归：H3 不得影响 OpenAI）。
+#[tokio::test]
+async fn openai_error_body_stays_openai_shaped() {
+    let base = spawn_gateway().await;
+    let r = reqwest::Client::new()
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&serde_json::json!({ "model": "deepseek-es", "messages": [] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 400);
+    let v: serde_json::Value = r.json().await.unwrap();
+    // OpenAI 结构：顶层 error，无 type:error
+    assert!(v["error"].is_object(), "OpenAI 错误结构被破坏: {v}");
+    assert!(v.get("type").is_none(), "OpenAI 错误不应有顶层 type: {v}");
+}
+
+// ── M4 回归：Anthropic 流式 usage 必须为真实值（非 0/0） ─────────
+
+#[tokio::test]
+async fn anthropic_stream_usage_is_nonzero() {
+    let base = spawn_gateway().await;
+    let body = reqwest::Client::new()
+        .post(format!("{base}/v1/messages"))
+        .json(&serde_json::json!({
+            "model": "deepseek-es", "max_tokens": 100,
+            "messages": [{"role":"user","content":"hi"}], "stream": true
+        }))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    // message_delta 携带 usage.output_tokens，必须 > 0
+    let md_line = body
+        .lines()
+        .zip(body.lines().skip(1))
+        .find(|(a, _)| a.contains("message_delta"))
+        .map(|(_, b)| b.to_string())
+        .expect("未找到 message_delta");
+    let json = md_line.trim_start_matches("data:").trim();
+    let v: serde_json::Value = serde_json::from_str(json).unwrap();
+    let out = v["usage"]["output_tokens"].as_u64().unwrap_or(0);
+    assert!(out > 0, "message_delta usage.output_tokens 仍为 0: {v}");
+}
+
+// ── M7 回归：上游异常结束（无 done）必须补全结束序列 ─────────────
+
+async fn spawn_mock_upstream_truncated() -> String {
+    let app = Router::new()
+        .route("/", get(mock_home))
+        .route("/wp-admin/admin-ajax.php", post(mock_ajax))
+        .route("/wp-admin/admin-ajax.php", get(mock_sse_truncated));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    format!("http://{}", addr)
+}
+
+/// 上游只发 delta、**不发 done** 就结束（模拟中途断开）。
+async fn mock_sse_truncated(
+    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    if q.get("cache_key").map(|s| s.as_str()) != Some("aipkit_sse_testkey") {
+        return Sse::new(futures::stream::iter(vec![Ok::<_, Infallible>(
+            Event::default()
+                .event("error")
+                .data(r#"{"error":"Message not found in cache."}"#),
+        )]));
+    }
+    let events = vec![
+        Ok::<_, Infallible>(
+            Event::default()
+                .event("message_start")
+                .data(r#"{"message_id":"m"}"#),
+        ),
+        Ok(Event::default().data(r#"{"delta":"partial"}"#)),
+        // 无 done 事件
+    ];
+    Sse::new(futures::stream::iter(events))
+}
+
+async fn spawn_gateway_with(upstream: String) -> String {
+    let solver = spawn_mock_solver().await;
+    let cfg = deepseek_es_2api::Config {
+        upstream_base_url: upstream,
+        cf_solver_url: solver,
+        solver_timeout_secs: 10,
+        ..Default::default()
+    };
+    let state = make_state(cfg);
+    let app = deepseek_es_2api::api::build_router(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    format!("http://{}", addr)
+}
+
+#[tokio::test]
+async fn openai_stream_abrupt_close_has_finish_reason() {
+    let base = spawn_gateway_with(spawn_mock_upstream_truncated().await).await;
+    let body = reqwest::Client::new()
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&serde_json::json!({
+            "model":"deepseek-es","messages":[{"role":"user","content":"hi"}],"stream":true
+        }))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(body.contains("partial"), "内容未送达: {body}");
+    assert!(
+        body.contains("finish_reason"),
+        "异常结束缺少 finish_reason: {body}"
+    );
+    assert!(body.contains("[DONE]"), "缺少 [DONE]: {body}");
+}
+
+#[tokio::test]
+async fn anthropic_stream_abrupt_close_has_message_stop() {
+    let base = spawn_gateway_with(spawn_mock_upstream_truncated().await).await;
+    let body = reqwest::Client::new()
+        .post(format!("{base}/v1/messages"))
+        .json(&serde_json::json!({
+            "model":"deepseek-es","max_tokens":100,
+            "messages":[{"role":"user","content":"hi"}],"stream":true
+        }))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(body.contains("partial"), "内容未送达: {body}");
+    assert!(
+        body.contains("message_stop"),
+        "异常结束缺少 message_stop: {body}"
+    );
+    assert!(
+        body.contains("message_delta"),
+        "异常结束缺少 message_delta: {body}"
+    );
+}
+
+// ── M11：Anthropic 非流式响应上限 ───────────────────────────────
+
+#[tokio::test]
+async fn anthropic_nonstream_respects_max_response_bytes() {
+    // 上限设为 1 字节，mock 上游必然超过 → 应返回错误而非无界聚合
+    let solver = spawn_mock_solver().await;
+    let cfg = deepseek_es_2api::Config {
+        upstream_base_url: spawn_mock_upstream().await,
+        cf_solver_url: solver,
+        solver_timeout_secs: 10,
+        max_response_bytes: 1,
+        ..Default::default()
+    };
+    let state = make_state(cfg);
+    let app = deepseek_es_2api::api::build_router(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let base = format!("http://{}", addr);
+    let r = reqwest::Client::new()
+        .post(format!("{base}/v1/messages"))
+        .json(&serde_json::json!({
+            "model":"deepseek-es","max_tokens":100,
+            "messages":[{"role":"user","content":"hi"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        !r.status().is_success(),
+        "超限应返回错误，实际 {}",
+        r.status()
+    );
+    let v: serde_json::Value = r.json().await.unwrap();
+    assert_eq!(v["type"], "error", "错误体应为 Anthropic 结构: {v}");
+}
+
+// ── H4：伪工具说明注入（端到端断言 prompt 含工具说明） ───────────
+
+#[tokio::test]
+async fn tool_instruction_reaches_upstream_when_enabled() {
+    let (upstream, seen) = spawn_mock_upstream_recording().await;
+    let solver = spawn_mock_solver().await;
+    let cfg = deepseek_es_2api::Config {
+        upstream_base_url: upstream,
+        cf_solver_url: solver,
+        solver_timeout_secs: 10,
+        pseudo_tools_enabled: true,
+        ..Default::default()
+    };
+    let state = make_state(cfg);
+    let app = deepseek_es_2api::api::build_router(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let base = format!("http://{}", addr);
+    let _ = reqwest::Client::new()
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&serde_json::json!({
+            "model":"deepseek-es","messages":[{"role":"user","content":"现在几点"}]
+        }))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let prompts = seen.lock().await;
+    assert!(!prompts.is_empty(), "上游未收到 message");
+    assert!(
+        prompts[0].contains("get_time"),
+        "工具说明未送达上游: {}",
+        prompts[0]
+    );
+    assert!(
+        prompts[0].contains("```tool"),
+        "工具块说明未送达: {}",
+        prompts[0]
+    );
+}

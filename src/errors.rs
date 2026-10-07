@@ -48,6 +48,21 @@ impl AppError {
         }
     }
 
+    /// Anthropic 风格错误类型字符串。
+    ///
+    /// Anthropic 的合法取值：`invalid_request_error` / `authentication_error` /
+    /// `permission_error` / `not_found_error` / `rate_limit_error` / `api_error` /
+    /// `overloaded_error`。**没有** `upstream_error`/`network_error`/`internal_error`，
+    /// 故这些统一映射为 `api_error`（否则 Anthropic SDK 无法识别）。
+    pub fn anthropic_error_type(&self) -> &'static str {
+        match self {
+            AppError::BadRequest(_) => "invalid_request_error",
+            AppError::Unauthorized => "authentication_error",
+            AppError::QuotaExhausted(_) => "rate_limit_error",
+            _ => "api_error",
+        }
+    }
+
     pub fn status(&self) -> StatusCode {
         match self {
             AppError::BadRequest(_) => StatusCode::BAD_REQUEST,
@@ -58,6 +73,23 @@ impl AppError {
             AppError::Network(_) => StatusCode::BAD_GATEWAY,
             AppError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
+    }
+
+    /// 转成 Anthropic 兼容错误响应体（H3 修复）。
+    ///
+    /// Anthropic 规范要求顶层 `{"type":"error","error":{"type":..,"message":..}}`，
+    /// 而非 OpenAI 的 `{"error":{...}}`。若返回 OpenAI 结构，Claude Code / Anthropic SDK
+    /// 解析错误时会失败。
+    pub fn into_anthropic_response(self) -> Response {
+        let status = self.status();
+        let body = serde_json::json!({
+            "type": "error",
+            "error": {
+                "type": self.anthropic_error_type(),
+                "message": self.to_string(),
+            }
+        });
+        (status, Json(body)).into_response()
     }
 }
 
@@ -101,6 +133,52 @@ mod tests {
         assert_eq!(
             AppError::QuotaExhausted("q".into()).error_type(),
             "rate_limit_error"
+        );
+    }
+
+    // ── H3 回归：Anthropic 错误类型必须是合法取值 ────────────────
+
+    #[test]
+    fn anthropic_error_type_only_uses_valid_values() {
+        const VALID: &[&str] = &[
+            "invalid_request_error",
+            "authentication_error",
+            "permission_error",
+            "not_found_error",
+            "rate_limit_error",
+            "api_error",
+            "overloaded_error",
+        ];
+        let all = [
+            AppError::BadRequest("x".into()),
+            AppError::Unauthorized,
+            AppError::TsRequired,
+            AppError::SolverFailed("s".into()),
+            AppError::QuotaExhausted("q".into()),
+            AppError::Upstream("u".into()),
+            AppError::UpstreamStream("us".into()),
+            AppError::Network("n".into()),
+            AppError::Internal("i".into()),
+        ];
+        for e in &all {
+            let t = e.anthropic_error_type();
+            assert!(
+                VALID.contains(&t),
+                "非法 Anthropic 错误类型: {t} (from {e:?})"
+            );
+        }
+        // 非 Anthropic 原生的类型必须收敛到 api_error
+        assert_eq!(
+            AppError::Upstream("u".into()).anthropic_error_type(),
+            "api_error"
+        );
+        assert_eq!(
+            AppError::Network("n".into()).anthropic_error_type(),
+            "api_error"
+        );
+        assert_eq!(
+            AppError::Internal("i".into()).anthropic_error_type(),
+            "api_error"
         );
     }
 }

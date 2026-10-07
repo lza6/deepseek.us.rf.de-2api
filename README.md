@@ -106,7 +106,7 @@ claude
 | **多 solver 负载均衡** | `solver_urls` | 轮询 + 健康探测 + 故障转移；空则用 `cf_solver_url` |
 | **语言注入** | `system_prompt_suffix` | 追加 system 指令（如"用用户语言回答"） |
 | **多轮对话** | — | 客户端发送的完整消息历史会被渲染进 prompt（见下） |
-| **伪工具调用** | — | 模型输出 ` ```tool ` JSON 块 → 网关本地执行并回填 |
+| **伪工具调用** | `pseudo_tools_enabled` | 启用后向模型注入工具说明；模型输出 ` ```tool ` JSON 块 → 网关本地执行并回填 |
 | **断线重放** | — | SSE 事件带 `id:`；见下方限制说明 |
 
 > **多轮对话语义**：上游虽按 `conversation_uuid` 承接历史，但标准 OpenAI/Anthropic 客户端

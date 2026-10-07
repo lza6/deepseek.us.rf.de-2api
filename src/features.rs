@@ -2,15 +2,26 @@
 //!
 //! 二者均在**网关侧**对 prompt / 输出做纯文本变换，不改上游协议。
 
-/// P3-6：在 prompt 前追加语言/风格指令（可配置）。上游默认西语输出，此注入用于纠正。
+/// H4：组合注入——把语言指令与（可选的）伪工具说明一并前置到 prompt。
 ///
-/// 因上游只接收单条消息，system 与 user 已由协议层拼接，这里再前置一段指令。
-pub fn inject_system_prompt(prompt: &str, suffix: &str) -> String {
-    let s = suffix.trim();
-    if s.is_empty() {
+/// 修复前：`TOOL_INSTRUCTION` 虽已定义，但**从未注入**，模型不知道可以发工具块，
+/// 导致伪工具功能实际不可用。此函数确保启用时说明真正进入 prompt。
+/// 两段都为空时返回原 prompt（无副作用）。
+///
+/// 取代旧的 `inject_system_prompt`（仅支持语言、无法注入工具说明，已删除）。
+pub fn inject_prompt_prefixes(prompt: &str, language_suffix: &str, pseudo_tools: bool) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    let lang = language_suffix.trim();
+    if !lang.is_empty() {
+        parts.push(lang);
+    }
+    if pseudo_tools {
+        parts.push(TOOL_INSTRUCTION);
+    }
+    if parts.is_empty() {
         return prompt.to_string();
     }
-    format!("{s}\n\n{prompt}")
+    format!("{}\n\n{prompt}", parts.join("\n\n"))
 }
 
 /// P3-7：伪工具调用——从模型输出中提取 fenced `tool` 代码块内的 JSON 调用。
@@ -147,17 +158,42 @@ mod tests {
     use super::*;
 
     #[test]
-    fn no_suffix_is_noop() {
-        assert_eq!(inject_system_prompt("hi", ""), "hi");
-        assert_eq!(inject_system_prompt("hi", "   "), "hi");
+    fn suffix_prepended() {
+        assert_eq!(
+            inject_prompt_prefixes("hi", "Responde en chino", false),
+            "Responde en chino\n\nhi"
+        );
+    }
+
+    // ── H4 回归：伪工具说明必须在启用时注入 ─────────────────────
+
+    #[test]
+    fn tool_instruction_injected_when_enabled() {
+        let p = inject_prompt_prefixes("hi", "", true);
+        assert!(p.contains("get_time"), "工具说明未注入: {p}");
+        assert!(p.contains("```tool"), "工具块格式未注入: {p}");
+        assert!(p.ends_with("hi"), "原 prompt 应保留在末尾: {p}");
     }
 
     #[test]
-    fn suffix_prepended() {
-        assert_eq!(
-            inject_system_prompt("hi", "Responde en chino"),
-            "Responde en chino\n\nhi"
-        );
+    fn tool_instruction_absent_when_disabled() {
+        let p = inject_prompt_prefixes("hi", "", false);
+        assert_eq!(p, "hi");
+        assert!(!p.contains("get_time"));
+    }
+
+    #[test]
+    fn language_and_tools_both_injected() {
+        let p = inject_prompt_prefixes("hi", "用中文回答", true);
+        assert!(p.contains("用中文回答"), "{p}");
+        assert!(p.contains("get_time"), "{p}");
+        assert!(p.ends_with("hi"), "{p}");
+    }
+
+    #[test]
+    fn no_prefixes_is_noop() {
+        assert_eq!(inject_prompt_prefixes("hi", "", false), "hi");
+        assert_eq!(inject_prompt_prefixes("hi", "   ", false), "hi");
     }
 
     #[test]

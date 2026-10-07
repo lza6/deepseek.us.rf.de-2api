@@ -193,8 +193,12 @@ async fn openai_chat(
         .unwrap_or_else(|| DEFAULT_MODEL.to_string());
     let meta = models::resolve_model(&model_id, &state.cfg.default_model);
     let raw_prompt = oai::messages_to_prompt(&req)?;
-    // P3-6：语言/风格指令注入
-    let prompt = features::inject_system_prompt(&raw_prompt, &state.cfg.system_prompt_suffix);
+    // P3-6 + H4：语言/风格指令 + 伪工具说明注入
+    let prompt = features::inject_prompt_prefixes(
+        &raw_prompt,
+        &state.cfg.system_prompt_suffix,
+        state.cfg.pseudo_tools_enabled,
+    );
     let stream = req.stream.unwrap_or(false);
     // P3-7：伪工具说明注入（仅当启用且非流式时提示模型可调用）
     let cache_key = ResponseCache::key(&model_id, &prompt);
@@ -262,6 +266,12 @@ async fn openai_chat(
         // 用 Arc<AtomicUsize> 在 map 闭包与末尾 once 之间共享完成字符数
         let acc = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let acc_c = acc.clone();
+        // M7：跟踪是否已收到 Done（据此决定异常结束时是否补 finish_reason 帧）
+        let oai_finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let fin_o = oai_finished.clone();
+        // M7 收尾链需要 id/model（map 闭包会 move 走，故先克隆）
+        let id_m7 = id.clone();
+        let model_m7 = model.clone();
         let out = head
             .chain(events.map(move |item| -> Result<Event, Infallible> {
                 let ev = match item {
@@ -276,10 +286,13 @@ async fn openai_chat(
                             false,
                         )
                     }
-                    oai::Translated::Done => (
-                        serde_json::to_string(&oai::stop_chunk(&id, &model)).unwrap(),
-                        true,
-                    ),
+                    oai::Translated::Done => {
+                        fin_o.store(true, std::sync::atomic::Ordering::Relaxed);
+                        (
+                            serde_json::to_string(&oai::stop_chunk(&id, &model)).unwrap(),
+                            true,
+                        )
+                    }
                     oai::Translated::Error(e) => (
                         serde_json::json!({"error":{"message":e,"type":"upstream_error"}})
                             .to_string(),
@@ -290,6 +303,12 @@ async fn openai_chat(
                             .to_string(),
                         false,
                     ),
+                    // M3：中途要求安全校验——发结构化错误（不泄漏哨兵字符串）
+                    oai::Translated::TsRequired => (
+                        serde_json::json!({"error":{"message":"上游要求重新安全校验，请重试","type":"api_error"}})
+                            .to_string(),
+                        false,
+                    ),
                 };
                 let seq = replay_body.push(&rid_body, format!("data: {data}"));
                 if is_done {
@@ -297,6 +316,25 @@ async fn openai_chat(
                 }
                 Ok(Event::default().id(seq.to_string()).data(data))
             }))
+            // M7：上游异常结束（未收到 Done）时补一帧带 finish_reason 的结束块
+            .chain(
+                futures::stream::once({
+                    let oai_finished = oai_finished.clone();
+                    let id = id_m7.clone();
+                    let model = model_m7.clone();
+                    async move {
+                        if oai_finished.load(std::sync::atomic::Ordering::Relaxed) {
+                            Vec::new()
+                        } else {
+                            let data =
+                                serde_json::to_string(&oai::stop_chunk(&id, &model)).unwrap();
+                            vec![Ok::<_, Infallible>(Event::default().data(data))]
+                        }
+                    }
+                })
+                .map(futures::stream::iter)
+                .flatten(),
+            )
             .chain(futures::stream::once({
                 let replay = replay.clone();
                 let rid = rid.clone();
@@ -345,11 +383,10 @@ async fn openai_chat(
             }
             Ok(oai::Translated::Done) => break,
             Ok(oai::Translated::Error(e)) => {
-                if e == "__TS_REQUIRED__" {
-                    return Err(AppError::TsRequired);
-                }
                 return Err(AppError::UpstreamStream(e));
             }
+            // M3：结构化 ts_required（不再用哨兵字符串比较）
+            Ok(oai::Translated::TsRequired) => return Err(AppError::TsRequired),
             Ok(oai::Translated::Quota(m)) => return Err(AppError::QuotaExhausted(m)),
             Err(e) => return Err(e),
         }
@@ -500,7 +537,7 @@ type TranslatedStream =
 /// 启动一次上游流（cache_message → stream_chat），返回翻译后的事件流与响应 id。
 ///
 /// `ts_required` 自愈：上游可能返回"安全校验失效"信号（首个事件即为
-/// `Translated::Error("__TS_REQUIRED__")`）。此时尚未向下游输出任何内容，
+/// `Translated::TsRequired`）。此时尚未向下游输出任何内容，
 /// 故可安全地强制重认证后**重试一次**。中途（已输出后）再遇该信号则不重试，
 /// 交由下游错误帧处理，避免重复输出。
 async fn start_stream(
@@ -514,13 +551,11 @@ async fn start_stream(
 
     // 探测首个事件，判断是否需要安全校验重试。
     let first = stream.next().await;
-    if let Some(Ok(oai::Translated::Error(ref e))) = first {
-        if e == "__TS_REQUIRED__" {
-            tracing::warn!("上游要求重新安全校验，强制重认证后重试");
-            state.upstream.force_reauth().await?;
-            let (stream2, id2) = start_stream_once(state, prompt, conv_uuid).await?;
-            return Ok((stream2, id2));
-        }
+    if let Some(Ok(oai::Translated::TsRequired)) = first {
+        tracing::warn!("上游要求重新安全校验，强制重认证后重试");
+        state.upstream.force_reauth().await?;
+        let (stream2, id2) = start_stream_once(state, prompt, conv_uuid).await?;
+        return Ok((stream2, id2));
     }
     // 无需重试：把已探测的事件拼回流首，保持原顺序。
     let head = futures::stream::iter(first);
@@ -551,10 +586,22 @@ async fn start_stream_once(
 
 // ── Anthropic /v1/messages ──────────────────────────────
 
+/// H3：Anthropic 端点对外错误必须是 Anthropic 结构（顶层 `type:"error"`）。
+/// 内部逻辑返回 `AppResult`，此处统一转换为 Anthropic 兼容响应体。
 async fn anthropic_messages(
     State(state): State<SharedState>,
     headers: HeaderMap,
     Json(req): Json<anth::MessagesRequest>,
+) -> Response {
+    anthropic_messages_inner(state, headers, req)
+        .await
+        .unwrap_or_else(|e| e.into_anthropic_response())
+}
+
+async fn anthropic_messages_inner(
+    state: SharedState,
+    headers: HeaderMap,
+    req: anth::MessagesRequest,
 ) -> AppResult<Response> {
     check_auth(&state.cfg, &headers)?;
     let model_id = req
@@ -562,7 +609,11 @@ async fn anthropic_messages(
         .clone()
         .unwrap_or_else(|| DEFAULT_MODEL.to_string());
     let meta = models::resolve_model(&model_id, &state.cfg.default_model);
-    let prompt = anth::messages_to_prompt(&req).map_err(AppError::BadRequest)?;
+    let prompt = features::inject_prompt_prefixes(
+        &anth::messages_to_prompt(&req).map_err(AppError::BadRequest)?,
+        &state.cfg.system_prompt_suffix,
+        state.cfg.pseudo_tools_enabled,
+    );
     let stream = req.stream.unwrap_or(false);
 
     let session_key = headers
@@ -579,6 +630,17 @@ async fn anthropic_messages(
         let msg_id = id.clone();
         let mut state_started = false;
         let mut block_started = false;
+        // M4：流式 usage 真实化（此前 message_start/message_delta 恒 0/0）
+        let prompt_tokens = estimate_tokens(&prompt);
+        // H3/M4：用 Arc 在 flat_map 与末尾 once 间共享输出累计与结束标记
+        let out_chars = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let out_c = out_chars.clone();
+        let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let fin_c = finished.clone();
+        // M7：跟踪是否已开过内容块（异常结束时据此决定是否补 content_block_stop）
+        let block_open = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let block_open_c = block_open.clone();
+        let prompt_tokens_c = prompt_tokens;
         let out = events.flat_map(move |item| {
             let model = model.clone();
             let msg_id = msg_id.clone();
@@ -597,7 +659,7 @@ async fn anthropic_messages(
                         stop_reason: None,
                         stop_sequence: None,
                         usage: anth::AnthropicUsage {
-                            input_tokens: 0,
+                            input_tokens: prompt_tokens_c,
                             output_tokens: 0,
                         },
                     },
@@ -606,8 +668,10 @@ async fn anthropic_messages(
             }
             match item {
                 Ok(oai::Translated::Delta(text)) => {
+                    out_c.fetch_add(text.chars().count(), std::sync::atomic::Ordering::Relaxed);
                     if !block_started {
                         block_started = true;
+                        block_open_c.store(true, std::sync::atomic::Ordering::Relaxed);
                         let cbs = anth::ContentBlockStart {
                             kind: anth::SSE_EVENT_CONTENT_BLOCK_START,
                             index: 0,
@@ -629,6 +693,7 @@ async fn anthropic_messages(
                     evs.push(Ok(sse_named(anth::SSE_EVENT_CONTENT_BLOCK_DELTA, &cbd)));
                 }
                 Ok(oai::Translated::Done) => {
+                    fin_c.store(true, std::sync::atomic::Ordering::Relaxed);
                     if block_started {
                         let cbs = anth::ContentBlockStop {
                             kind: anth::SSE_EVENT_CONTENT_BLOCK_STOP,
@@ -644,7 +709,8 @@ async fn anthropic_messages(
                         },
                         usage: anth::AnthropicUsage {
                             input_tokens: 0,
-                            output_tokens: 0,
+                            output_tokens: (out_c.load(std::sync::atomic::Ordering::Relaxed) / 2)
+                                .max(1) as u32,
                         },
                     };
                     evs.push(Ok(sse_named(anth::SSE_EVENT_MESSAGE_DELTA, &md)));
@@ -656,7 +722,15 @@ async fn anthropic_messages(
                 Ok(oai::Translated::Error(e)) => {
                     let body = serde_json::json!({
                         "type": "error",
-                        "error": {"type": "upstream_error", "message": e}
+                        "error": {"type": "api_error", "message": e}
+                    });
+                    evs.push(Ok(Event::default().event("error").data(body.to_string())));
+                }
+                // M3：结构化 ts_required（Anthropic 合法类型用 api_error）
+                Ok(oai::Translated::TsRequired) => {
+                    let body = serde_json::json!({
+                        "type": "error",
+                        "error": {"type": "api_error", "message": "上游要求重新安全校验，请重试"}
                     });
                     evs.push(Ok(Event::default().event("error").data(body.to_string())));
                 }
@@ -670,26 +744,73 @@ async fn anthropic_messages(
                 Err(e) => {
                     let body = serde_json::json!({
                         "type": "error",
-                        "error": {"type": "upstream_error", "message": e.to_string()}
+                        "error": {"type": "api_error", "message": e.to_string()}
                     });
                     evs.push(Ok(Event::default().event("error").data(body.to_string())));
                 }
             }
             futures::stream::iter(evs)
         });
-        // P3-3：Anthropic 流式入账（流结束触发；token 用 prompt 估算 + 0 完成计数兜底）
+        // M7：上游异常结束（断开/错误）时补发标准结束序列，避免客户端把截断当正常结束。
+        let out = out.chain(
+            futures::stream::once({
+                let finished = finished.clone();
+                let block_open = block_open.clone();
+                let out_chars = out_chars.clone();
+                async move {
+                    if finished.load(std::sync::atomic::Ordering::Relaxed) {
+                        Vec::new()
+                    } else {
+                        let mut evs: Vec<Result<Event, Infallible>> = Vec::new();
+                        if block_open.load(std::sync::atomic::Ordering::Relaxed) {
+                            let cbs = anth::ContentBlockStop {
+                                kind: anth::SSE_EVENT_CONTENT_BLOCK_STOP,
+                                index: 0,
+                            };
+                            evs.push(Ok(sse_named(anth::SSE_EVENT_CONTENT_BLOCK_STOP, &cbs)));
+                        }
+                        let md = anth::MessageDelta {
+                            kind: anth::SSE_EVENT_MESSAGE_DELTA,
+                            delta: anth::DeltaStop {
+                                stop_reason: "end_turn".into(),
+                                stop_sequence: None,
+                            },
+                            usage: anth::AnthropicUsage {
+                                input_tokens: 0,
+                                output_tokens: (out_chars
+                                    .load(std::sync::atomic::Ordering::Relaxed)
+                                    / 2)
+                                .max(1) as u32,
+                            },
+                        };
+                        evs.push(Ok(sse_named(anth::SSE_EVENT_MESSAGE_DELTA, &md)));
+                        let ms = anth::MessageStop {
+                            kind: anth::SSE_EVENT_MESSAGE_STOP,
+                        };
+                        evs.push(Ok(sse_named(anth::SSE_EVENT_MESSAGE_STOP, &ms)));
+                        evs
+                    }
+                }
+            })
+            .map(futures::stream::iter)
+            .flatten(),
+        );
+        // P3-3：Anthropic 流式入账（流结束触发；token 用 prompt 估算 + 输出字符估算）
         let ledger_s = state.ledger.clone();
         let model_s = model_id.clone();
         let key_s = ledger::key_id(&headers);
         let prompt_s = prompt.clone();
+        let out_chars_l = out_chars.clone();
         let out = out.chain(futures::stream::once(async move {
+            let out_tok =
+                (out_chars_l.load(std::sync::atomic::Ordering::Relaxed) / 2).max(1) as u32;
             ledger_s
                 .record(UsageRecord {
                     ts: now_secs(),
                     model: model_s,
                     key_id: key_s,
                     prompt_tokens: estimate_tokens(&prompt_s),
-                    completion_tokens: 0,
+                    completion_tokens: out_tok,
                     latency_ms: 0,
                     status: 200,
                     stream: true,
@@ -706,11 +827,19 @@ async fn anthropic_messages(
     let mut full = String::new();
     while let Some(item) = events.next().await {
         match item {
-            Ok(oai::Translated::Delta(t)) => full.push_str(&t),
+            Ok(oai::Translated::Delta(t)) => {
+                // M11：与 OpenAI 非流式对齐的响应上限保护
+                if full.len() + t.len() > state.cfg.max_response_bytes {
+                    return Err(AppError::Upstream("响应体超过上限".into()));
+                }
+                full.push_str(&t);
+            }
             Ok(oai::Translated::Done) => break,
             Ok(oai::Translated::Error(e)) => {
                 return Err(AppError::UpstreamStream(e));
             }
+            // M3：结构化 ts_required
+            Ok(oai::Translated::TsRequired) => return Err(AppError::TsRequired),
             Ok(oai::Translated::Quota(m)) => return Err(AppError::QuotaExhausted(m)),
             Err(e) => return Err(e),
         }
@@ -755,7 +884,17 @@ async fn count_tokens(
     State(state): State<SharedState>,
     headers: HeaderMap,
     Json(req): Json<anth::MessagesRequest>,
-) -> AppResult<Json<serde_json::Value>> {
+) -> Response {
+    count_tokens_inner(state, headers, req)
+        .await
+        .unwrap_or_else(|e| e.into_anthropic_response())
+}
+
+async fn count_tokens_inner(
+    state: SharedState,
+    headers: HeaderMap,
+    req: anth::MessagesRequest,
+) -> AppResult<Response> {
     check_auth(&state.cfg, &headers)?;
     let text = match anth::messages_to_prompt(&req) {
         Ok(t) => t,
@@ -769,7 +908,7 @@ async fn count_tokens(
         }
     };
     let tokens = estimate_tokens(&text);
-    Ok(Json(serde_json::json!({ "input_tokens": tokens })))
+    Ok(Json(serde_json::json!({ "input_tokens": tokens })).into_response())
 }
 
 /// 粗略 token 估算：CJK 字符约 1 token/字，其它约 1 token/4 字符（P2-8：修正中文严重低估）。
