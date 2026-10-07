@@ -2460,3 +2460,34 @@ async fn zero_temperature_still_cached() {
         "温度 0 第二次应命中缓存（只打上游 1 次），实际 {n} 次"
     );
 }
+
+// ── L6：同一流内 created 一致 ───────────────────────────────
+
+#[tokio::test]
+async fn stream_created_is_consistent() {
+    let base = spawn_gateway().await;
+    let body = reqwest::Client::new()
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&serde_json::json!({
+            "model":"deepseek-es","messages":[{"role":"user","content":"hi"}],"stream":true
+        }))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let createds: Vec<i64> = body
+        .lines()
+        .filter(|l| l.starts_with("data:"))
+        .filter_map(|l| l.trim_start_matches("data:").trim().strip_prefix('{'))
+        .filter_map(|j| serde_json::from_str::<serde_json::Value>(&format!("{{{j}")).ok())
+        .filter_map(|v| v.get("created").and_then(|c| c.as_i64()))
+        .collect();
+    assert!(createds.len() >= 2, "应有多个 chunk: {body}");
+    let first = createds[0];
+    assert!(
+        createds.iter().all(|c| *c == first),
+        "同一流内 created 应一致，实际: {createds:?}"
+    );
+}

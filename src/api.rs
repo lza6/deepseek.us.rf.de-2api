@@ -310,11 +310,13 @@ async fn openai_chat_inner(
         // P3-5：断线重放缓冲
         let replay = state.replay.clone();
         let rid = id.clone();
+        // L6：流开始时取一次 created，全流共享（此前每 chunk 重取，跨秒边界不一致）
+        let created = now_secs();
         let head = futures::stream::once({
             let replay = replay.clone();
             let rid = rid.clone();
             async move {
-                let fc = oai::first_chunk(&id_head, &model_head);
+                let fc = oai::first_chunk_at(&id_head, &model_head, created);
                 let data = serde_json::to_string(&fc).unwrap();
                 let seq = replay.push(&rid, format!("data: {data}"));
                 Ok::<_, Infallible>(Event::default().id(seq.to_string()).data(data))
@@ -361,14 +363,14 @@ async fn openai_chat_inner(
                             if let crate::tools::FilterOut::Text(t) = filter.push(&text) {
                                 if !t.is_empty() {
                                     let data =
-                                        serde_json::to_string(&oai::content_chunk(&id, &model, &t))
+                                        serde_json::to_string(&oai::content_chunk_at(&id, &model, &t, created))
                                             .unwrap();
                                     push_data(data);
                                 }
                             }
                         } else {
                             let data =
-                                serde_json::to_string(&oai::content_chunk(&id, &model, &text)).unwrap();
+                                serde_json::to_string(&oai::content_chunk_at(&id, &model, &text, created)).unwrap();
                             push_data(data);
                         }
                     }
@@ -385,25 +387,26 @@ async fn openai_chat_inner(
                                 push_data(data);
                             }
                             for (i, inv) in calls.iter().enumerate() {
-                                let data = serde_json::to_string(&oai::tool_call_chunk(
+                                let data = serde_json::to_string(&oai::tool_call_chunk_at(
                                     &id,
                                     &model,
                                     i as u32,
                                     &inv.id,
                                     &inv.name,
                                     &inv.arguments.to_string(),
+                                    created,
                                 ))
                                 .unwrap();
                                 push_data(data);
                             }
                             let reason = if calls.is_empty() { "stop" } else { "tool_calls" };
                             let data =
-                                serde_json::to_string(&oai::stop_chunk_reason(&id, &model, reason))
+                                serde_json::to_string(&oai::stop_chunk_reason_at(&id, &model, reason, created))
                                     .unwrap();
                             push_data(data);
                             replay_body.finish(&rid_body);
                         } else {
-                            let data = serde_json::to_string(&oai::stop_chunk(&id, &model)).unwrap();
+                            let data = serde_json::to_string(&oai::stop_chunk_reason_at(&id, &model, "stop", created)).unwrap();
                             let seq = replay_body.push(&rid_body, format!("data: {data}"));
                             evs.push(Ok(Event::default().id(seq.to_string()).data(data)));
                             replay_body.finish(&rid_body);
@@ -443,7 +446,7 @@ async fn openai_chat_inner(
                             Vec::new()
                         } else {
                             let data =
-                                serde_json::to_string(&oai::stop_chunk(&id, &model)).unwrap();
+                                serde_json::to_string(&oai::stop_chunk_reason_at(&id, &model, "stop", created)).unwrap();
                             vec![Ok::<_, Infallible>(Event::default().data(data))]
                         }
                     }

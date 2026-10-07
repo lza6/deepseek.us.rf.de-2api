@@ -2,6 +2,28 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/) 与 [语义化版本](https://semver.org/)。
 
+## [0.15.0] - 2026-10-08
+
+**L6 收尾**：同一 SSE 流内所有 chunk 共享同一 `created` 时间戳。
+
+### Fixed
+- **L6 · `now_secs()` 每 chunk 重取，流内 `created` 不一致**：长流跨秒边界时同一响应的
+  chunk 会带不同 `created`。修复：流开始时取一次 `created`，全流共享
+  （新增 `first_chunk_at` / `content_chunk_at` / `stop_chunk_reason_at` / `tool_call_chunk_at` /
+  `usage_chunk_at` 变体）。非流式路径各自取一次，不受影响。
+  测试：`stream_created_is_consistent`。
+
+### Verified
+- `cargo test --all`：**138 单测 + 60 集成全绿**（较 v0.14.0 新增 1 集成）；fmt / clippy 干净。
+- **真实 E2E（最终二进制）**：`e2e-v1` **8/8** 通过。
+- **压测**：8 并发 × 24 = **100%**，p50=2512ms。
+
+### 未做（如实说明，见 TASK-LEDGER.md）
+- **§6.2 协议族抽象**：结构性重构（trait Protocol），风险高、收益有限，**不做**。
+- **`admin_token` 哈希 / 下游 key 过期**：破坏性配置变更。
+
+---
+
 ## [0.14.0] - 2026-10-08
 
 **§6.5 缓存语义化**：温度非 0（明确的随机性请求）不再缓存。

@@ -41,7 +41,7 @@
 | L3 | `ChatChunk` 无 usage；不支持 `stream_options.include_usage` | ✅ v0.11.0 | usage_chunk + stream_options |
 | L4 | Anthropic 消息 id 复用 `chatcmpl-` | ✅ v0.11.0 | `to_anthropic_msg_id` |
 | L5 | Anthropic 流首帧即错误仍先发 message_start | ✅ v0.12.0 | is_err_item 跳过 |
-| L6 | `now_secs()` 每 chunk 重取，`created` 不一致 | ⏳ **待办** | 流内应固定 created |
+| L6 | `now_secs()` 每 chunk 重取，`created` 不一致 | ✅ v0.15.0 | 流内共享 created |
 | L7 | `message_delta.usage` 含 `input_tokens` | ✅ v0.11.0 | `OutputUsage` |
 | L8 | Anthropic 端点不走 ResponseCache | ✅ v0.11.0 | 已接入 |
 | L9 | `deterministic_uuid` 用 FNV-1a | ℹ️ 已知 | 影响面小；可改加密哈希 |
