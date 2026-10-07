@@ -77,6 +77,9 @@ impl SystemField {
 }
 
 /// 把 Anthropic messages 转成上游单条提示。
+///
+/// **H2 修复**（与 OpenAI 侧一致）：Anthropic 客户端同样每轮发送完整历史。
+/// 多轮时渲染完整转录（带角色标注），单轮时保持原样。
 pub fn messages_to_prompt(req: &MessagesRequest) -> Result<String, String> {
     if req.messages.is_empty() {
         return Err("messages 不能为空".into());
@@ -86,19 +89,29 @@ pub fn messages_to_prompt(req: &MessagesRequest) -> Result<String, String> {
         .as_ref()
         .map(|s| s.text())
         .filter(|s| !s.trim().is_empty());
-    let last_user = req
+
+    let turns: Vec<&AnthropicMessage> = req
         .messages
         .iter()
-        .rev()
-        .find(|m| m.role == "user")
-        .map(|m| m.text())
-        .ok_or_else(|| "缺少 user 消息".to_string())?;
-    if last_user.trim().is_empty() {
-        return Err("user 消息内容为空".into());
+        .filter(|m| !m.text().trim().is_empty())
+        .collect();
+    if turns.is_empty() || !turns.iter().any(|m| m.role == "user") {
+        return Err("缺少 user 消息".into());
     }
+
+    let history = if turns.len() == 1 {
+        turns[0].text()
+    } else {
+        turns
+            .iter()
+            .map(|m| format!("{}: {}", m.role, m.text()))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
     Ok(match system {
-        Some(s) => format!("{s}\n\n{last_user}"),
-        None => last_user,
+        Some(s) => format!("{s}\n\n{history}"),
+        None => history,
     })
 }
 
@@ -251,5 +264,54 @@ mod tests {
             temperature: None,
         };
         assert_eq!(messages_to_prompt(&req).unwrap(), "sys\n\nhello");
+    }
+
+    // ── H2 回归：Anthropic 多轮历史必须保留 ──────────────────────
+
+    #[test]
+    fn anthropic_multi_turn_history_preserved() {
+        let req = MessagesRequest {
+            model: None,
+            system: None,
+            messages: vec![
+                am("user", "我叫小明"),
+                am("assistant", "你好"),
+                am("user", "我叫什么"),
+            ],
+            max_tokens: None,
+            stream: None,
+            temperature: None,
+        };
+        let p = messages_to_prompt(&req).unwrap();
+        assert!(
+            p.contains("我叫小明") && p.contains("你好") && p.contains("我叫什么"),
+            "{p}"
+        );
+    }
+
+    #[test]
+    fn anthropic_single_turn_unchanged() {
+        let req = MessagesRequest {
+            model: None,
+            system: None,
+            messages: vec![am("user", "hi")],
+            max_tokens: None,
+            stream: None,
+            temperature: None,
+        };
+        assert_eq!(messages_to_prompt(&req).unwrap(), "hi");
+    }
+
+    #[test]
+    fn anthropic_missing_user_errors() {
+        let req = MessagesRequest {
+            model: None,
+            system: None,
+            messages: vec![am("assistant", "hi")],
+            max_tokens: None,
+            stream: None,
+            temperature: None,
+        };
+        assert!(messages_to_prompt(&req).is_err());
     }
 }

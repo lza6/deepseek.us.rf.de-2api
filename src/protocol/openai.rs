@@ -64,9 +64,22 @@ impl Message {
 
 /// 把 OpenAI messages 转成上游单条文本提示。
 ///
-/// 上游（AIPKit bot）只接收单条消息，历史由服务端按 conversation_uuid 维护。
-/// 因此这里把 system + 最近 user 内容拼成 prompt；若含多轮历史，
-/// 保留最近一轮 user 文本（其余由会话 UUID 承接）。
+/// **H2 修复**：上游（AIPKit bot）只接收单条消息，历史本应由服务端按
+/// `conversation_uuid` 维护。但标准 OpenAI 客户端**每轮发送完整历史**，
+/// 且多数 SDK 默认不设 `user` 字段 → 网关侧无法稳定映射 conv_uuid
+/// → 若只取末条 user，则**整个历史被静默丢弃**（模型只看到最后一句话）。
+///
+/// 因此这里改为：**当请求含多轮对话时，把完整历史按角色标注渲染进 prompt**
+/// （网关自身无状态、每轮独立可复现）；**单轮**请求保持原样（向后兼容）。
+///
+/// 渲染格式（多轮时）：
+/// ```text
+/// <system 行拼接>
+///
+/// user: ...
+/// assistant: ...
+/// user: ...
+/// ```
 pub fn messages_to_prompt(req: &ChatRequest) -> AppResult<String> {
     if req.messages.is_empty() {
         return Err(AppError::BadRequest("messages 不能为空".into()));
@@ -80,23 +93,38 @@ pub fn messages_to_prompt(req: &ChatRequest) -> AppResult<String> {
         .filter(|s| !s.trim().is_empty())
         .collect();
 
-    // 最后一条 user
-    let last_user = req
+    // 非 system 的对话轮次
+    let turns: Vec<&Message> = req
         .messages
         .iter()
-        .rev()
-        .find(|m| m.role == "user")
-        .map(|m| m.text())
-        .ok_or_else(|| AppError::BadRequest("缺少 user 消息".into()))?;
+        .filter(|m| m.role != "system" && !m.text().trim().is_empty())
+        .collect();
 
-    if last_user.trim().is_empty() {
-        return Err(AppError::BadRequest("user 消息内容为空".into()));
+    if turns.is_empty() {
+        return Err(AppError::BadRequest("缺少 user 消息".into()));
     }
 
-    if system.is_empty() {
-        Ok(last_user)
+    // 必须至少有一条 user（否则模型无输入）
+    if !turns.iter().any(|m| m.role == "user") {
+        return Err(AppError::BadRequest("缺少 user 消息".into()));
+    }
+
+    // 单轮（仅一条消息）：保持旧行为，不引入角色前缀（向后兼容）
+    let history = if turns.len() == 1 {
+        turns[0].text()
     } else {
-        Ok(format!("{}\n\n{}", system.join("\n"), last_user))
+        // 多轮：渲染完整转录，带角色标注，保证模型能看到全部上下文
+        turns
+            .iter()
+            .map(|m| format!("{}: {}", m.role, m.text()))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    if system.is_empty() {
+        Ok(history)
+    } else {
+        Ok(format!("{}\n\n{}", system.join("\n"), history))
     }
 }
 
@@ -312,7 +340,8 @@ mod tests {
     }
 
     #[test]
-    fn prompt_picks_last_user() {
+    fn prompt_multi_turn_keeps_all() {
+        // H2：此测试此前断言"只取末条"（错误行为）。多轮客户端必须保留全部历史。
         let req = ChatRequest {
             model: None,
             messages: vec![
@@ -325,7 +354,11 @@ mod tests {
             max_tokens: None,
             user: None,
         };
-        assert_eq!(messages_to_prompt(&req).unwrap(), "second");
+        let p = messages_to_prompt(&req).unwrap();
+        assert!(
+            p.contains("first") && p.contains("ok") && p.contains("second"),
+            "{p}"
+        );
     }
 
     #[test]
@@ -420,5 +453,85 @@ mod tests {
             translate_event(&ev),
             Some(Translated::Quota("上游配额耗尽".into()))
         );
+    }
+
+    // ── H2 回归：多轮历史必须保留 ────────────────────────────────
+
+    #[test]
+    fn multi_turn_history_preserved() {
+        // 标准 OpenAI 客户端每轮发来完整历史；网关必须把所有轮次送入 prompt，
+        // 而非只取最后一条 user（否则第 2 轮起静默丢失上下文）。
+        let req = ChatRequest {
+            model: None,
+            messages: vec![
+                msg("user", "我叫小明"),
+                msg("assistant", "你好小明"),
+                msg("user", "我叫什么"),
+            ],
+            stream: None,
+            temperature: None,
+            max_tokens: None,
+            user: None,
+        };
+        let p = messages_to_prompt(&req).unwrap();
+        assert!(p.contains("我叫小明"), "首轮 user 丢失: {p}");
+        assert!(p.contains("你好小明"), "assistant 轮丢失: {p}");
+        assert!(p.contains("我叫什么"), "末轮 user 丢失: {p}");
+    }
+
+    #[test]
+    fn multi_turn_roles_labeled() {
+        // 历史应带角色标注，避免模型无法区分谁说的
+        let req = ChatRequest {
+            model: None,
+            messages: vec![msg("user", "A"), msg("assistant", "B"), msg("user", "C")],
+            stream: None,
+            temperature: None,
+            max_tokens: None,
+            user: None,
+        };
+        let p = messages_to_prompt(&req).unwrap();
+        assert!(p.contains("user: A") || p.contains("A"), "{p}");
+        // 至少保证顺序：A 在 B 前，B 在 C 前
+        let (ia, ib, ic) = (
+            p.find('A').unwrap(),
+            p.find('B').unwrap(),
+            p.find('C').unwrap(),
+        );
+        assert!(ia < ib && ib < ic, "轮次顺序错乱: {p}");
+    }
+
+    #[test]
+    fn single_turn_unchanged_shape() {
+        // 单轮（无历史）不应引入多余角色前缀，保持与旧行为兼容
+        let req = ChatRequest {
+            model: None,
+            messages: vec![msg("user", "hello")],
+            stream: None,
+            temperature: None,
+            max_tokens: None,
+            user: None,
+        };
+        assert_eq!(messages_to_prompt(&req).unwrap(), "hello");
+    }
+
+    #[test]
+    fn system_plus_multi_turn() {
+        let req = ChatRequest {
+            model: None,
+            messages: vec![
+                msg("system", "be brief"),
+                msg("user", "A"),
+                msg("assistant", "B"),
+                msg("user", "C"),
+            ],
+            stream: None,
+            temperature: None,
+            max_tokens: None,
+            user: None,
+        };
+        let p = messages_to_prompt(&req).unwrap();
+        assert!(p.starts_with("be brief"), "system 应在最前: {p}");
+        assert!(p.contains('A') && p.contains('B') && p.contains('C'), "{p}");
     }
 }

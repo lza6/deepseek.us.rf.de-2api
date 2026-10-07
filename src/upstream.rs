@@ -589,18 +589,44 @@ pub struct SseEvent {
     pub data: String,
 }
 
+/// SSE 解析缓冲上限（字节）。超过则判定上游异常（无分隔符的长流），
+/// 发出错误并停止，避免内存无界增长。
+pub const MAX_SSE_BUF_BYTES: usize = 8 * 1024 * 1024;
+
+/// 在字节缓冲中查找最早的 SSE 事件分隔符，返回 (偏移, 分隔符长度)。
+///
+/// 支持 SSE 规范允许的三种行尾：`\n\n`、`\r\n\r\n`、`\r\r`。
+/// 返回最早出现的分隔符（按起始偏移最小），保证不跨事件误并。
+fn find_block_sep(buf: &[u8]) -> Option<(usize, usize)> {
+    let lf = find_subslice(buf, b"\n\n").map(|i| (i, 2));
+    let crlf = find_subslice(buf, b"\r\n\r\n").map(|i| (i, 4));
+    let cr = find_subslice(buf, b"\r\r").map(|i| (i, 2));
+    [lf, crlf, cr].into_iter().flatten().min_by_key(|(i, _)| *i)
+}
+
+fn find_subslice(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || hay.len() < needle.len() {
+        return None;
+    }
+    hay.windows(needle.len()).position(|w| w == needle)
+}
+
 /// 把字节流解析为 SSE 事件流（按空行分隔）。
 ///
 /// 规范：SSE 以空行分隔事件；无 `event:` 行的块 = 默认 `message` 事件。
 /// 首个 `:` 开头的行是注释（心跳/填充），忽略。
 /// 流结束时 flush 残留块——即使上游末尾没有空行也不会丢最后一个事件（P2-4）。
+///
+/// **H1 修复**：缓冲**原始字节**（`Vec<u8>`），只在完整事件边界解码。
+/// 避免 `from_utf8_lossy` 在 chunk 边界切断多字节码点时把 CJK/emoji 损坏为 U+FFFD。
+/// 不完整的尾字节保留在缓冲区，等下一个 chunk 补齐（或流结束按 lossy 兜底）。
 pub fn parse_sse_stream<S>(stream: S) -> impl futures::Stream<Item = AppResult<SseEvent>>
 where
     S: futures::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send + 'static,
 {
     struct St<S> {
         s: std::pin::Pin<Box<S>>,
-        buf: String,
+        buf: Vec<u8>,
         done: bool,
         /// 待发出的流错误（缓冲排空后再发，保证顺序）
         pending_err: Option<String>,
@@ -608,7 +634,7 @@ where
     futures::stream::unfold(
         St {
             s: Box::pin(stream),
-            buf: String::new(),
+            buf: Vec::new(),
             done: false,
             pending_err: None,
         },
@@ -616,20 +642,21 @@ where
             loop {
                 // 优先消费缓冲区中已完整的事件块（无论来自本次还是上次 chunk）。
                 // 关键：必须在 await 前先 drain，否则单次 chunk 内的多个事件会被丢弃。
-                if let Some(sep) = st.buf.find("\n\n") {
-                    let block = st.buf[..sep].to_string();
-                    st.buf = st.buf[sep + 2..].to_string();
-                    if let Some(ev) = parse_block(&block) {
+                if let Some((sep, seplen)) = find_block_sep(&st.buf) {
+                    let block = st.buf[..sep].to_vec();
+                    st.buf.drain(..sep + seplen);
+                    // 完整块在分隔符处已保证是完整 UTF-8（分隔符本身是 ASCII）
+                    if let Some(ev) = parse_block_bytes(&block) {
                         return Some((Ok(ev), st));
                     }
                     continue;
                 }
                 if st.done {
                     // 流结束：flush 残留块（无尾随空行时不丢事件）
-                    if !st.buf.trim().is_empty() {
-                        let ev = parse_block(&st.buf);
-                        st.buf.clear();
-                        if let Some(ev) = ev {
+                    if !st.buf.iter().all(|b| b.is_ascii_whitespace()) {
+                        // 末尾残留可能是被截断的多字节字符：用 lossy 兜底解码（不 panic）
+                        let block = std::mem::take(&mut st.buf);
+                        if let Some(ev) = parse_block_bytes(&block) {
                             return Some((Ok(ev), st));
                         }
                     }
@@ -647,7 +674,17 @@ where
                 }
                 match st.s.next().await {
                     Some(Ok(b)) => {
-                        st.buf.push_str(&String::from_utf8_lossy(&b));
+                        st.buf.extend_from_slice(&b);
+                        // 上限保护：无分隔符的超大流判定异常
+                        if st.buf.len() > MAX_SSE_BUF_BYTES {
+                            tracing::warn!(
+                                "SSE 缓冲超过 {} 字节仍无分隔符，判定上游异常",
+                                MAX_SSE_BUF_BYTES
+                            );
+                            st.done = true;
+                            st.pending_err = Some("上游流异常：单事件超过大小上限".to_string());
+                            st.buf.clear();
+                        }
                     }
                     Some(Err(e)) => {
                         st.done = true;
@@ -660,6 +697,18 @@ where
             }
         },
     )
+}
+
+/// 从完整事件块的**原始字节**解析事件。
+///
+/// 块内已是完整 UTF-8（由分隔符保证），但末尾可能残留被截断的多字节字符，
+/// 故用 `from_utf8` 成功优先、失败时 `from_utf8_lossy` 兜底（不丢事件、不 panic）。
+fn parse_block_bytes(block: &[u8]) -> Option<SseEvent> {
+    let text: std::borrow::Cow<'_, str> = match std::str::from_utf8(block) {
+        Ok(s) => std::borrow::Cow::Borrowed(s),
+        Err(_) => String::from_utf8_lossy(block),
+    };
+    parse_block(&text)
 }
 
 fn parse_block(block: &str) -> Option<SseEvent> {
@@ -759,5 +808,111 @@ mod tests {
     #[test]
     fn decode_entities_amp() {
         assert_eq!(decode_entities("&#038;"), "&");
+    }
+
+    // ── H1 回归：多字节 UTF-8 跨 chunk 边界不得损坏 ──────────────
+
+    #[tokio::test]
+    async fn sse_multibyte_split_across_chunks() {
+        use futures::StreamExt;
+        // "你好" = E4 BD A0 E5 A5 BD。把第二个字符从中间切开分两个 chunk 发出。
+        // 修复前：from_utf8_lossy 会把两半各替换为 U+FFFD → "好" 损坏。
+        let full = "data: {\"delta\":\"你好\"}\n\n".as_bytes().to_vec();
+        // 在 "你好" 内部（第 4 字节处）切分
+        let cut = full.windows(2).position(|w| w == [0xE5, 0xA5]).unwrap();
+        let (a, b) = full.split_at(cut);
+        let chunks: Vec<Result<bytes::Bytes, reqwest::Error>> = vec![
+            Ok(bytes::Bytes::copy_from_slice(a)),
+            Ok(bytes::Bytes::copy_from_slice(b)),
+        ];
+        let s = parse_sse_stream(futures::stream::iter(chunks));
+        let evs: Vec<_> = s.collect().await;
+        assert_eq!(evs.len(), 1, "应产出 1 个事件: {evs:?}");
+        let ev = evs[0].as_ref().unwrap();
+        assert_eq!(
+            ev.data, "{\"delta\":\"你好\"}",
+            "多字节字符被损坏: {}",
+            ev.data
+        );
+        assert!(
+            !ev.data.contains('\u{FFFD}'),
+            "出现替换符 U+FFFD: {}",
+            ev.data
+        );
+    }
+
+    #[tokio::test]
+    async fn sse_multibyte_split_at_every_boundary() {
+        use futures::StreamExt;
+        // 逐字节切分（最极端），每个 chunk 仅 1 字节，验证缓冲正确重组。
+        let full = "data: {\"delta\":\"漢字テスト😀\"}\n\n".as_bytes().to_vec();
+        let chunks: Vec<Result<bytes::Bytes, reqwest::Error>> = full
+            .chunks(1)
+            .map(|c| Ok(bytes::Bytes::copy_from_slice(c)))
+            .collect();
+        let s = parse_sse_stream(futures::stream::iter(chunks));
+        let evs: Vec<_> = s.collect().await;
+        assert_eq!(evs.len(), 1);
+        let ev = evs[0].as_ref().unwrap();
+        assert_eq!(
+            ev.data, "{\"delta\":\"漢字テスト😀\"}",
+            "逐字节切分损坏: {}",
+            ev.data
+        );
+    }
+
+    #[tokio::test]
+    async fn sse_partial_utf8_left_in_buffer_no_replacement() {
+        use futures::StreamExt;
+        // 第一个 chunk 以半个 3 字节字符结尾：该半字符必须留在缓冲区，
+        // 不得立即产生替换符；下一个 chunk 补齐后应得到完整字符。
+        let (a, b) = "data: {\"delta\":\"中\"}\n\n".as_bytes().split_at(15); // 在 "中" 中间
+        let chunks: Vec<Result<bytes::Bytes, reqwest::Error>> = vec![
+            Ok(bytes::Bytes::copy_from_slice(a)),
+            Ok(bytes::Bytes::copy_from_slice(b)),
+        ];
+        let s = parse_sse_stream(futures::stream::iter(chunks));
+        let evs: Vec<_> = s.collect().await;
+        assert_eq!(evs.len(), 1);
+        assert_eq!(evs[0].as_ref().unwrap().data, "{\"delta\":\"中\"}");
+    }
+
+    #[tokio::test]
+    async fn sse_crlf_block_separator() {
+        use futures::StreamExt;
+        // M1：上游若用 \r\n\r\n 分隔，必须能正确分帧（否则整段塌缩为一个块）。
+        let raw = b"event: message_start\r\ndata: {\"message_id\":\"m\"}\r\n\r\n\
+                    data: {\"delta\":\"a\"}\r\n\r\n\
+                    event: done\r\ndata: {\"finished\":true}\r\n\r\n";
+        let chunks: Vec<Result<bytes::Bytes, reqwest::Error>> =
+            vec![Ok(bytes::Bytes::from_static(raw))];
+        let s = parse_sse_stream(futures::stream::iter(chunks));
+        let evs: Vec<_> = s.collect().await;
+        let names: Vec<_> = evs
+            .iter()
+            .map(|e| e.as_ref().unwrap().event.clone())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["message_start", "message", "done"],
+            "CRLF 分帧失败: {names:?}"
+        );
+        assert_eq!(evs[1].as_ref().unwrap().data, "{\"delta\":\"a\"}");
+    }
+
+    #[tokio::test]
+    async fn sse_oversized_buffer_emits_error_not_oom() {
+        use futures::stream;
+        use futures::StreamExt;
+        // 无分隔符的超大流：必须触发上限保护（错误帧），而非无界增长。
+        let big = bytes::Bytes::from(vec![b'x'; MAX_SSE_BUF_BYTES + 1]);
+        let chunks: Vec<Result<bytes::Bytes, reqwest::Error>> =
+            vec![Ok(big), Ok(bytes::Bytes::from_static(b""))];
+        let s = parse_sse_stream(stream::iter(chunks));
+        let evs: Vec<_> = s.collect().await;
+        let has_err = evs
+            .iter()
+            .any(|e| matches!(e, Ok(ev) if ev.event == "__stream_error__"));
+        assert!(has_err, "超限未触发保护: {evs:?}");
     }
 }

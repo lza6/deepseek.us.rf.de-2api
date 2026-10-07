@@ -1132,3 +1132,187 @@ async fn anthropic_requests_are_recorded() {
     let st = ledger.stats(None).await.unwrap();
     assert_eq!(st.total_requests, 1, "Anthropic 请求应入账");
 }
+
+// ── H2 回归：多轮历史真实送达上游 ─────────────────────────────
+
+/// mock 上游：记录收到的 `message` 表单字段（即网关送给上游的真实 prompt）。
+async fn spawn_mock_upstream_recording() -> (String, Arc<tokio::sync::Mutex<Vec<String>>>) {
+    let seen: Arc<tokio::sync::Mutex<Vec<String>>> = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let s1 = seen.clone();
+
+    #[derive(serde::Deserialize)]
+    struct F2 {
+        #[serde(default)]
+        action: String,
+        #[serde(default)]
+        message: String,
+    }
+
+    let app = Router::new()
+        .route("/", get(mock_home))
+        .route(
+            "/wp-admin/admin-ajax.php",
+            post(move |axum::extract::Form(f): axum::extract::Form<F2>| {
+                let s = s1.clone();
+                async move {
+                    match f.action.as_str() {
+                        "deepseek_ts_verify" => {
+                            let mut h = axum::http::HeaderMap::new();
+                            h.insert(
+                                "set-cookie",
+                                axum::http::HeaderValue::from_static("dsts_ok=1; Path=/"),
+                            );
+                            (axum::http::StatusCode::OK, h, r#"{"ok":true}"#.to_string())
+                        }
+                        "aipkit_get_frontend_chat_nonce" => (
+                            axum::http::StatusCode::OK,
+                            axum::http::HeaderMap::new(),
+                            r#"{"success":true,"data":{"nonce":"n"}}"#.to_string(),
+                        ),
+                        "aipkit_cache_sse_message" => {
+                            s.lock().await.push(f.message.clone());
+                            (
+                                axum::http::StatusCode::OK,
+                                axum::http::HeaderMap::new(),
+                                r#"{"success":true,"data":{"cache_key":"aipkit_sse_testkey"}}"#
+                                    .to_string(),
+                            )
+                        }
+                        _ => (
+                            axum::http::StatusCode::OK,
+                            axum::http::HeaderMap::new(),
+                            r#"{"success":false}"#.to_string(),
+                        ),
+                    }
+                }
+            }),
+        )
+        .route("/wp-admin/admin-ajax.php", get(mock_sse));
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (format!("http://{}", addr), seen)
+}
+
+/// HIGH：多轮对话历史必须被完整送入上游（否则模型只看到最后一句话）。
+#[tokio::test]
+async fn multi_turn_history_reaches_upstream() {
+    let (upstream, seen) = spawn_mock_upstream_recording().await;
+    let solver = spawn_mock_solver().await;
+    let cfg = deepseek_es_2api::Config {
+        upstream_base_url: upstream,
+        cf_solver_url: solver,
+        solver_timeout_secs: 10,
+        ..Default::default()
+    };
+    let state = make_state(cfg);
+    let app = deepseek_es_2api::api::build_router(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let base = format!("http://{}", addr);
+
+    let _ = reqwest::Client::new()
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&serde_json::json!({
+            "model":"deepseek-es",
+            "messages":[
+                {"role":"user","content":"我叫小明"},
+                {"role":"assistant","content":"你好小明"},
+                {"role":"user","content":"我叫什么"}
+            ]
+        }))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+
+    let prompts = seen.lock().await;
+    assert!(!prompts.is_empty(), "上游未收到任何 message");
+    let p = &prompts[0];
+    assert!(p.contains("我叫小明"), "首轮历史未送上游: {p}");
+    assert!(p.contains("你好小明"), "assistant 轮未送上游: {p}");
+    assert!(p.contains("我叫什么"), "末轮未送上游: {p}");
+}
+
+/// HIGH：无 `user` 字段的**单轮**请求保持无状态（不引入随机串扰），
+/// 多轮请求则自带完整历史，两者都不依赖上游 conv_uuid。
+#[tokio::test]
+async fn multibyte_content_survives_gateway() {
+    // H1 端到端：mock 上游发多字节内容，网关输出不得出现 U+FFFD。
+    let upstream = spawn_mock_upstream_multibyte().await;
+    let solver = spawn_mock_solver().await;
+    let cfg = deepseek_es_2api::Config {
+        upstream_base_url: upstream,
+        cf_solver_url: solver,
+        solver_timeout_secs: 10,
+        ..Default::default()
+    };
+    let state = make_state(cfg);
+    let app = deepseek_es_2api::api::build_router(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let base = format!("http://{}", addr);
+
+    let body = reqwest::Client::new()
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&serde_json::json!({
+            "model":"deepseek-es",
+            "messages":[{"role":"user","content":"hi"}]
+        }))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(body.contains("你好世界"), "多字节内容丢失: {body}");
+    assert!(!body.contains('\u{FFFD}'), "出现替换符: {body}");
+}
+
+/// mock 上游：SSE 含中文内容（验证 H1 端到端）。
+async fn spawn_mock_upstream_multibyte() -> String {
+    let app = Router::new()
+        .route("/", get(mock_home))
+        .route("/wp-admin/admin-ajax.php", post(mock_ajax))
+        .route("/wp-admin/admin-ajax.php", get(mock_sse_multibyte));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    format!("http://{}", addr)
+}
+
+async fn mock_sse_multibyte(
+    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    if q.get("cache_key").map(|s| s.as_str()) != Some("aipkit_sse_testkey") {
+        return Sse::new(futures::stream::iter(vec![Ok::<_, Infallible>(
+            Event::default()
+                .event("error")
+                .data(r#"{"error":"Message not found in cache."}"#),
+        )]));
+    }
+    let events = vec![
+        Ok::<_, Infallible>(
+            Event::default()
+                .event("message_start")
+                .data(r#"{"message_id":"m"}"#),
+        ),
+        Ok(Event::default().data(r#"{"delta":"你好"}"#)),
+        Ok(Event::default().data(r#"{"delta":"世界"}"#)),
+        Ok(Event::default().event("done").data(r#"{"finished":true}"#)),
+    ];
+    Sse::new(futures::stream::iter(events))
+}

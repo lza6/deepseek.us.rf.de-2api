@@ -2,7 +2,56 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/) 与 [语义化版本](https://semver.org/)。
 
+## [0.4.0] - 2026-10-07
+
+两项 **HIGH 级正确性修复**，均由独立审计发现、经真实 E2E 反证确认、并按 TDD 流程修复。
+其中 H1 是「唯一会造成**静默内容损坏**」的缺陷。
+
+### Fixed
+- **HIGH · SSE 多字节字符静默损坏（H1）**：`parse_sse_stream` 原用
+  `String::from_utf8_lossy(&b)` 直接解码每个网络 chunk。chunk 边界是任意的，
+  可能落在 UTF-8 码点中间——被截断的半个码点被替换为 U+FFFD，下一 chunk 的前导续字节
+  同样被替换，**一个 CJK/emoji 字符损坏成两个替换符**。上游为西语站点但常服务中文用户，
+  属高概率事件。
+  修复：改为**字节级缓冲**（`Vec<u8>`），只在完整事件边界解码；不完整尾字节留在缓冲等待补齐。
+  同时支持 SSE 规范允许的 `\r\n\r\n` / `\r\r` 分隔符（M1），并新增 8MB 缓冲上限保护
+  （无分隔符的超大流判定异常而非无界增长）。
+  反证：旧实现下 `漢字テスト😀` → `??????????`；修复后完整保留。
+- **HIGH · 多轮对话历史被整体丢弃（H2）**：`messages_to_prompt` 只取最后一条 user，
+  历史交给上游 `conversation_uuid` 承接。但标准 OpenAI 客户端**每轮发送完整历史**且
+  多数 SDK 默认不设 `user` 字段 → 网关每次生成随机 conv_uuid → 上游视为全新会话 →
+  **整个历史被静默丢弃**，模型只看到最后一句话。Anthropic 侧有相同缺陷。
+  修复：多轮请求渲染**完整转录**（带 role 标注），单轮保持原样（向后兼容）。
+  反证：旧实现下第 2 轮回答「我无法看到你之前的消息，所以不知道你最喜欢的颜色是什么」；
+  修复后正确回答「紫色」。
+
+### Added
+- 回归测试：`sse_multibyte_split_across_chunks`、`sse_multibyte_split_at_every_boundary`、
+  `sse_partial_utf8_left_in_buffer_no_replacement`、`sse_crlf_block_separator`、
+  `sse_oversized_buffer_emits_error_not_oom`（`src/upstream.rs`）；
+  `multi_turn_history_preserved`、`multi_turn_roles_labeled`、`single_turn_unchanged_shape`、
+  `system_plus_multi_turn`（`src/protocol/openai.rs`）；
+  `anthropic_multi_turn_history_preserved`、`anthropic_single_turn_unchanged`、
+  `anthropic_missing_user_errors`（`src/protocol/anthropic.rs`）。
+- 集成测试：`multi_turn_history_reaches_upstream`（断言多轮历史真实送达上游）、
+  `multibyte_content_survives_gateway`（断言端到端无 U+FFFD）。
+- 脚本：`scripts/e2e-multiturn.mjs`（真实多轮 E2E）、`scripts/e2e-diagnose.mjs`（SSE 诊断）。
+
+### Verified
+- `cargo test --all`：**89 单测 + 25 集成全绿**（较 v0.3.1 新增 12 单测 + 2 集成）；
+  `cargo fmt --all -- --check` 与 `cargo clippy --all-targets -- -D warnings` 均干净。
+- **真实 E2E**（连真实上游 deepseek.es + cf_solver）：
+  - H1：中文流式回复 `1+1 等于 **2**。` 完整无 `�`；16 并发中文流式请求 **0 个替换符**。
+  - H2：无 `user` 字段的两轮对话，模型准确回忆起第 1 轮内容（回答「紫色」）。
+  - 反证实验：临时恢复旧代码后，H1 输出替换符、H2 回答「无法看到之前的消息」——
+    证明两项修复解决的是**真实缺陷**而非理论问题。
+- **压测**：8 并发 × 24 请求 = **100% 成功**，p50=1721ms、p99=2783ms、QPS 5.25；
+  32 并发 × 64 请求 = **100% 成功**，p50=210ms、p99=328ms、QPS 138.83。
+
+---
+
 ## [0.3.1] - 2026-10-06
+
 
 独立审计（P3 新增模块）后修复 5 项——其中 2 项为「宣称有实现但实际不可达」的假实现，
 与项目「真实闭环」契约冲突，属必须修复。
