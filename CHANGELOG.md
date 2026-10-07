@@ -2,6 +2,31 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/) 与 [语义化版本](https://semver.org/)。
 
+## [0.14.0] - 2026-10-08
+
+**§6.5 缓存语义化**：温度非 0（明确的随机性请求）不再缓存。
+
+### Fixed
+- **§6.5 · 缓存未考虑 `temperature`**：此前只按「无会话历史」判定可缓存，
+  但 `temperature > 0` 是**明确的随机性请求**，缓存会把一次随机结果当确定结果复用。
+  修复：OpenAI 与 Anthropic 两端均要求 `temperature <= 0`（或未指定）才缓存。
+  注：缓存键用的是完整 prompt，**已天然包含** `system_prompt_suffix` 与语言指令
+  （审计建议的该项在实际实现中不成立）。
+  测试：`high_temperature_not_cached`（高温两次都打上游）、`zero_temperature_still_cached`
+  （温度 0 只打 1 次）—— 用**上游调用计数**判定，避免本地 mock 计时抖动。
+
+### Verified
+- `cargo test --all`：**138 单测 + 59 集成全绿**（较 v0.13.0 新增 2 集成）；fmt / clippy 干净。
+- **真实 E2E（最终二进制）**：`e2e-v1` **8/8** 通过。
+- **压测**：8 并发 × 24 = **100%**，p50=2134ms、QPS 4.03。
+
+### 未做（如实说明，见 TASK-LEDGER.md）
+- **L6**（流内 `created` 不一致）：纯 Cosmetic，修复需穿透多闭包，改动面大收益低。
+- **§6.2 协议族抽象**：结构性重构，风险高收益有限。
+- **`admin_token` 哈希 / 下游 key 过期**：破坏性配置变更。
+
+---
+
 ## [0.13.0] - 2026-10-08
 
 **§6.6 安全加固**：独立审计发现的真实风险——`/admin` 无限流，`admin_token` 可被暴力破解。

@@ -271,8 +271,11 @@ async fn openai_chat_inner(
             .and_then(|v| v.to_str().ok())
             .map(|s| s.to_string())
     });
-    // 缓存仅在"无会话历史"（纯单轮）时启用，避免与上游多轮上下文语义冲突
-    let cacheable = session_key.is_none();
+    // 缓存仅在"无会话历史"（纯单轮）时启用，避免与上游多轮上下文语义冲突。
+    // §6.5：温度非 0（明确的随机性请求）不缓存——避免把随机结果当确定结果复用。
+    // 注：缓存键用的是完整 prompt，已天然包含 system_prompt_suffix 与语言指令。
+    let temp_is_zero = req.temperature.map(|t| t <= 0.0).unwrap_or(true);
+    let cacheable = session_key.is_none() && temp_is_zero;
     let (_sid, conv_uuid) = state.sessions.get_or_create(session_key.as_deref());
 
     // P3-2：缓存命中（仅非流式 + 可缓存）
@@ -898,8 +901,9 @@ async fn anthropic_messages_inner(
     let (_sid, conv_uuid) = state.sessions.get_or_create(session_key.as_deref());
 
     // L8：Anthropic 端点也接入响应缓存（此前仅 OpenAI 走，重复请求恒打上游）。
-    // 与 OpenAI 一致：仅非流式 + 无会话历史（纯单轮）时缓存，避免语义冲突。
-    let cacheable = session_key.is_none() && tool_defs.is_empty();
+    // 与 OpenAI 一致：仅非流式 + 无会话历史（纯单轮）+ 温度 0 时缓存。
+    let anth_temp_zero = req.temperature.map(|t| t <= 0.0).unwrap_or(true);
+    let cacheable = session_key.is_none() && tool_defs.is_empty() && anth_temp_zero;
     let cache_key = crate::cache::ResponseCache::key(&model_id, &prompt);
     if !stream && cacheable {
         if let Some(hit) = state.cache.get(cache_key) {

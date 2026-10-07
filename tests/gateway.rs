@@ -2383,3 +2383,80 @@ async fn admin_rate_limited() {
     }
     assert!(got_429, "连续请求应触发 /admin 限流");
 }
+
+// ── §6.5：温度非 0 的请求不缓存（用上游调用次数判定，避免计时抖动） ──
+
+#[tokio::test]
+async fn high_temperature_not_cached() {
+    let (upstream, seen) = spawn_mock_upstream_recording().await;
+    let solver = spawn_mock_solver().await;
+    let cfg = deepseek_es_2api::Config {
+        upstream_base_url: upstream,
+        cf_solver_url: solver,
+        solver_timeout_secs: 10,
+        ..Default::default()
+    };
+    let state = make_state(cfg);
+    let app = deepseek_es_2api::api::build_router(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let base = format!("http://{}", addr);
+    let body = serde_json::json!({
+        "model":"deepseek-es","messages":[{"role":"user","content":"hot-temp"}],"temperature":0.9
+    });
+    for _ in 0..2 {
+        let _ = reqwest::Client::new()
+            .post(format!("{base}/v1/chat/completions"))
+            .json(&body)
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+    }
+    let n = seen.lock().await.len();
+    assert_eq!(n, 2, "温度非 0 时两次都应打上游（不缓存），实际 {n} 次");
+}
+
+#[tokio::test]
+async fn zero_temperature_still_cached() {
+    let (upstream, seen) = spawn_mock_upstream_recording().await;
+    let solver = spawn_mock_solver().await;
+    let cfg = deepseek_es_2api::Config {
+        upstream_base_url: upstream,
+        cf_solver_url: solver,
+        solver_timeout_secs: 10,
+        ..Default::default()
+    };
+    let state = make_state(cfg);
+    let app = deepseek_es_2api::api::build_router(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let base = format!("http://{}", addr);
+    let body = serde_json::json!({
+        "model":"deepseek-es","messages":[{"role":"user","content":"cold-temp"}],"temperature":0
+    });
+    for _ in 0..2 {
+        let _ = reqwest::Client::new()
+            .post(format!("{base}/v1/chat/completions"))
+            .json(&body)
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+    }
+    let n = seen.lock().await.len();
+    assert_eq!(
+        n, 1,
+        "温度 0 第二次应命中缓存（只打上游 1 次），实际 {n} 次"
+    );
+}
