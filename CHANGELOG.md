@@ -2,7 +2,62 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/) 与 [语义化版本](https://semver.org/)。
 
+## [0.7.0] - 2026-10-07
+
+**协议级工具调用（v2.0.0 核心能力）**：OpenAI `tools`/`tool_calls` 与 Anthropic
+`tools`/`tool_use`/`tool_result` 全链路支持，流式与非流式、两协议均覆盖。
+
+> **上游约束（如实说明）**：上游 AIPKit **不支持原生 function calling**（实测 `allowTools=false`）。
+> 本实现是**网关侧协议翻译**：把客户端声明的工具渲染成说明注入 prompt，模型按约定输出
+> fenced ` ```tool ` 块，网关解析后产出**标准协议结构**（非伪造——客户端能收到合法的
+> `tool_calls`/`tool_use` 并回传结果，真实模型能基于结果作答，已由真实 E2E 证明）。
+
+### Added
+- **新模块 `src/tools.rs`**：
+  - `ToolDef` / `ToolInvocation` 中间表示。
+  - `render_tool_prompt()`：把工具定义渲染为注入 prompt 的说明（含调用格式约定）。
+  - `parse_invocations()`：解析模型输出中的 ```tool 块（兼容 `arguments`/`parameters` 键，多调用、id 唯一）。
+  - `StreamToolFilter`：**流式 hold-back 状态机**——工具块内容不泄漏给下游文本流，
+    且正确处理 **fence 标记被 delta 切断**（如 "`" + "`" + "`tool"）的边界；流结束时解析工具调用。
+- **OpenAI 侧**：请求解析 `tools`/`tool_choice`；`role:"tool"` 消息与 assistant `tool_calls`
+  渲染进转录；非流式产出 `choices[].message.tool_calls` + `finish_reason:"tool_calls"`；
+  流式产出 `delta.tool_calls`（含 `index`/`id`/`function.name`/`function.arguments`）。
+- **Anthropic 侧**：请求解析 `tools`（`input_schema`）；`tool_use`/`tool_result` 内容块；
+  非流式产出 `content[].type=="tool_use"` + `stop_reason:"tool_use"`；
+  流式产出 `content_block_start(tool_use)` + `input_json_delta`。
+- 脚本 `scripts/e2e-tools.mjs`（真实工具往返 E2E）。
+- 计划文档 `计划书/工具调用实施计划.md`。
+
+### Fixed
+- **Anthropic `tool_result` 内容丢失（真实 bug，E2E 发现）**：Anthropic 规范中 `tool_result`
+  的结果放在 **`content` 字段**（可为字符串或块数组），而非 `text`。原实现只读 `text`，
+  导致客户端回传的工具结果**被静默丢弃**，模型第 2 轮无法基于结果作答（真实 E2E 首次暴露：
+  第 2 轮返回空串）。修复：新增 `TextBlock::readable()`（覆盖 `text` 与 `tool_result.content`），
+  并修正 `render_turn` / `is_empty` 使用它。修复后真实 E2E 第 2 轮正确回答。
+
+### Verified
+- `cargo test --all`：**132 单测 + 38 集成全绿**（较 v0.6.0 新增 31 单测 + 5 集成）；
+  `cargo fmt --all -- --check` 与 `cargo clippy --all-targets -- -D warnings` 均干净。
+- **真实 E2E（OpenAI 工具往返，连真实上游 deepseek.es + cf_solver）**：
+  ```
+  第1轮 finish_reason: tool_calls
+  tool_calls: [{"id":"call_...","type":"function","function":{"name":"get_weather","arguments":"{\"city\":\"北京\"}"}}]
+  本地执行工具: get_weather {"city":"北京"} → {"city":"北京","temp_c":25,"condition":"晴"}
+  第2轮最终回答: "根据查询结果，北京今天天气**晴**，气温约 **25°C**，体感比较舒适，适合外出。"
+  ```
+- **真实 E2E（Anthropic 工具往返）**：
+  ```
+  stop_reason: tool_use
+  tool_use: {"type":"tool_use","id":"call_...","name":"get_weather","input":{"city":"上海"}}
+  本地执行 → {"city":"上海","temp_c":22,"condition":"多云"}
+  第2轮: "上海今天天气：多云，气温约 22°C。"
+  ```
+- **压测**：8 并发 × 24 请求 = **100% 成功**，p50=1976ms、p99=3305ms、QPS 4.47。
+
+---
+
 ## [0.6.0] - 2026-10-07
+
 
 **可靠性加固批次**（指南 v1.5.0 首批）：关闭 M2 / M5 / M8 / M9，并如实标注 M6 为上游能力缺口。
 

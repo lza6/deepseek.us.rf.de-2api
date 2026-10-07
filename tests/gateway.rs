@@ -1608,3 +1608,186 @@ async fn tool_instruction_reaches_upstream_when_enabled() {
         prompts[0]
     );
 }
+
+// ── v2.0.0：协议级工具调用（端到端） ───────────────────────────
+
+/// mock 上游：SSE 输出一段文本 + 一个 ```tool 块。
+async fn spawn_mock_upstream_toolcall() -> String {
+    let app = Router::new()
+        .route("/", get(mock_home))
+        .route("/wp-admin/admin-ajax.php", post(mock_ajax))
+        .route("/wp-admin/admin-ajax.php", get(mock_sse_toolcall));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    format!("http://{}", addr)
+}
+
+async fn mock_sse_toolcall(
+    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    if q.get("cache_key").map(|s| s.as_str()) != Some("aipkit_sse_testkey") {
+        return Sse::new(futures::stream::iter(vec![Ok::<_, Infallible>(
+            Event::default()
+                .event("error")
+                .data(r#"{"error":"no cache"}"#),
+        )]));
+    }
+    // 分片发出，含被切断的 fence（验证 hold-back）
+    let events = vec![
+        Ok::<_, Infallible>(
+            Event::default()
+                .event("message_start")
+                .data(r#"{"message_id":"m"}"#),
+        ),
+        Ok(Event::default().data(r#"{"delta":"让我查一下。"}"#)),
+        Ok(Event::default().data(r#"{"delta":"\n``"}"#)),
+        Ok(Event::default().data(r#"{"delta":"`tool\n"}"#)),
+        Ok(Event::default()
+            .data(r#"{"delta":"{\"name\":\"get_weather\",\"arguments\":{\"city\":\"北京\"}}\n"}"#)),
+        Ok(Event::default().data(r#"{"delta":"```"}"#)),
+        Ok(Event::default().data(r#"{"delta":"\n查完了。"}"#)),
+        Ok(Event::default().event("done").data(r#"{"finished":true}"#)),
+    ];
+    Sse::new(futures::stream::iter(events))
+}
+
+/// OpenAI 非流式：客户端传 tools → 模型输出 tool 块 → 响应含 tool_calls。
+#[tokio::test]
+async fn openai_tool_call_nonstream() {
+    let base = spawn_gateway_with(spawn_mock_upstream_toolcall().await).await;
+    let v: serde_json::Value = reqwest::Client::new()
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&serde_json::json!({
+            "model":"deepseek-es",
+            "messages":[{"role":"user","content":"北京天气？"}],
+            "tools":[{"type":"function","function":{"name":"get_weather","description":"查天气","parameters":{"type":"object","properties":{"city":{"type":"string"}}}}}]
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let msg = &v["choices"][0]["message"];
+    assert_eq!(v["choices"][0]["finish_reason"], "tool_calls", "{v}");
+    let tcs = msg["tool_calls"].as_array().expect("应有 tool_calls");
+    assert_eq!(tcs.len(), 1, "{v}");
+    assert_eq!(tcs[0]["type"], "function");
+    assert_eq!(tcs[0]["function"]["name"], "get_weather");
+    let args: serde_json::Value =
+        serde_json::from_str(tcs[0]["function"]["arguments"].as_str().unwrap()).unwrap();
+    assert_eq!(args["city"], "北京");
+    // 工具块不应出现在 content
+    assert!(
+        !msg["content"].as_str().unwrap_or("").contains("```"),
+        "工具块泄漏到 content: {v}"
+    );
+}
+
+/// OpenAI 流式：tool_calls 以 delta 形式产出，且工具块不泄漏。
+#[tokio::test]
+async fn openai_tool_call_stream() {
+    let base = spawn_gateway_with(spawn_mock_upstream_toolcall().await).await;
+    let body = reqwest::Client::new()
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&serde_json::json!({
+            "model":"deepseek-es",
+            "messages":[{"role":"user","content":"北京天气？"}],
+            "stream":true,
+            "tools":[{"type":"function","function":{"name":"get_weather","parameters":{"type":"object"}}}]
+        }))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        body.contains("\"tool_calls\""),
+        "流式应含 tool_calls: {body}"
+    );
+    assert!(body.contains("get_weather"), "{body}");
+    assert!(body.contains("\"finish_reason\":\"tool_calls\""), "{body}");
+    // hold-back：原始工具块不得泄漏
+    assert!(!body.contains("```tool"), "工具块泄漏到流: {body}");
+    assert!(body.contains("让我查一下"), "文本应放行: {body}");
+}
+
+/// Anthropic 非流式：tools → tool_use 块 + stop_reason=tool_use。
+#[tokio::test]
+async fn anthropic_tool_use_nonstream() {
+    let base = spawn_gateway_with(spawn_mock_upstream_toolcall().await).await;
+    let v: serde_json::Value = reqwest::Client::new()
+        .post(format!("{base}/v1/messages"))
+        .json(&serde_json::json!({
+            "model":"deepseek-es","max_tokens":100,
+            "messages":[{"role":"user","content":"北京天气？"}],
+            "tools":[{"name":"get_weather","description":"查天气","input_schema":{"type":"object"}}]
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(v["stop_reason"], "tool_use", "{v}");
+    let blocks = v["content"].as_array().expect("content 数组");
+    let tool = blocks
+        .iter()
+        .find(|b| b["type"] == "tool_use")
+        .expect("应有 tool_use 块");
+    assert_eq!(tool["name"], "get_weather");
+    assert_eq!(tool["input"]["city"], "北京");
+    assert!(tool["id"].as_str().unwrap().starts_with("call_"), "{v}");
+}
+
+/// Anthropic 流式：tool_use content_block + input_json_delta。
+#[tokio::test]
+async fn anthropic_tool_use_stream() {
+    let base = spawn_gateway_with(spawn_mock_upstream_toolcall().await).await;
+    let body = reqwest::Client::new()
+        .post(format!("{base}/v1/messages"))
+        .json(&serde_json::json!({
+            "model":"deepseek-es","max_tokens":100,
+            "messages":[{"role":"user","content":"北京天气？"}],
+            "stream":true,
+            "tools":[{"name":"get_weather","input_schema":{"type":"object"}}]
+        }))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(body.contains("tool_use"), "应含 tool_use 块: {body}");
+    assert!(
+        body.contains("input_json_delta"),
+        "应含 input_json_delta: {body}"
+    );
+    assert!(body.contains("\"stop_reason\":\"tool_use\""), "{body}");
+    assert!(!body.contains("```tool"), "工具块泄漏: {body}");
+}
+
+/// 不传 tools 时行为完全不变（回归）。
+#[tokio::test]
+async fn no_tools_unchanged_behavior() {
+    let base = spawn_gateway_with(spawn_mock_upstream_toolcall().await).await;
+    let v: serde_json::Value = reqwest::Client::new()
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&serde_json::json!({
+            "model":"deepseek-es",
+            "messages":[{"role":"user","content":"hi"}]
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    // 无 tools：恒 "stop"，无 tool_calls 字段
+    assert_eq!(v["choices"][0]["finish_reason"], "stop", "{v}");
+    assert!(v["choices"][0]["message"]["tool_calls"].is_null(), "{v}");
+}

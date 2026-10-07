@@ -24,6 +24,29 @@ pub struct ChatRequest {
     pub max_tokens: Option<u32>,
     #[serde(default)]
     pub user: Option<String>,
+    /// v2.0.0：工具定义。`null`/缺省 = 不使用工具（走原路径）。
+    #[serde(default)]
+    pub tools: Option<Vec<ToolSpec>>,
+    /// "auto"/"none"/"required"/{"type":"function","function":{"name":..}}
+    #[serde(default)]
+    pub tool_choice: Option<serde_json::Value>,
+}
+
+/// OpenAI 工具声明包装：`{"type":"function","function":{...}}`。
+#[derive(Debug, Clone, Deserialize)]
+pub struct ToolSpec {
+    #[serde(rename = "type", default)]
+    pub kind: Option<String>,
+    pub function: FunctionDef,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct FunctionDef {
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub parameters: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -31,6 +54,29 @@ pub struct Message {
     pub role: String,
     #[serde(default)]
     pub content: Option<Content>,
+    /// 助手消息中模型发起的工具调用（回传历史时出现）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCallMsg>>,
+    /// `role:"tool"` 消息对应的调用 id。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+}
+
+/// 历史消息里的工具调用（OpenAI 结构）。
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ToolCallMsg {
+    pub id: String,
+    #[serde(rename = "type", default)]
+    pub kind: Option<String>,
+    pub function: ToolCallFunction,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ToolCallFunction {
+    pub name: String,
+    /// 参数字符串（OpenAI 约定为 JSON 字符串）。
+    #[serde(default)]
+    pub arguments: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -72,14 +118,8 @@ impl Message {
 /// 因此这里改为：**当请求含多轮对话时，把完整历史按角色标注渲染进 prompt**
 /// （网关自身无状态、每轮独立可复现）；**单轮**请求保持原样（向后兼容）。
 ///
-/// 渲染格式（多轮时）：
-/// ```text
-/// <system 行拼接>
-///
-/// user: ...
-/// assistant: ...
-/// user: ...
-/// ```
+/// **v2.0.0 工具调用**：`role:"tool"` 消息（工具结果）与 assistant 的 `tool_calls`
+/// 也会被渲染进转录，使模型能看到「调用了什么工具、返回了什么」。
 pub fn messages_to_prompt(req: &ChatRequest) -> AppResult<String> {
     if req.messages.is_empty() {
         return Err(AppError::BadRequest("messages 不能为空".into()));
@@ -93,30 +133,32 @@ pub fn messages_to_prompt(req: &ChatRequest) -> AppResult<String> {
         .filter(|s| !s.trim().is_empty())
         .collect();
 
-    // 非 system 的对话轮次
+    // 非 system 的对话轮次（tool 消息单独渲染，不参与"空内容"过滤）
     let turns: Vec<&Message> = req
         .messages
         .iter()
-        .filter(|m| m.role != "system" && !m.text().trim().is_empty())
+        .filter(|m| m.role != "system")
+        .filter(|m| m.role == "tool" || m.tool_calls.is_some() || !m.text().trim().is_empty())
         .collect();
 
     if turns.is_empty() {
         return Err(AppError::BadRequest("缺少 user 消息".into()));
     }
 
-    // 必须至少有一条 user（否则模型无输入）
-    if !turns.iter().any(|m| m.role == "user") {
+    // 必须至少有一条 user 或 tool（否则模型无输入）
+    if !turns.iter().any(|m| m.role == "user" || m.role == "tool") {
         return Err(AppError::BadRequest("缺少 user 消息".into()));
     }
 
-    // 单轮（仅一条消息）：保持旧行为，不引入角色前缀（向后兼容）
-    let history = if turns.len() == 1 {
+    // 单轮（仅一条普通消息）：保持旧行为，不引入角色前缀（向后兼容）
+    let single_plain = turns.len() == 1 && turns[0].role != "tool" && turns[0].tool_calls.is_none();
+    let history = if single_plain {
         turns[0].text()
     } else {
-        // 多轮：渲染完整转录，带角色标注，保证模型能看到全部上下文
+        // 多轮 / 含工具：渲染完整转录，带角色标注
         turns
             .iter()
-            .map(|m| format!("{}: {}", m.role, m.text()))
+            .map(|m| render_turn(m))
             .collect::<Vec<_>>()
             .join("\n")
     };
@@ -126,6 +168,54 @@ pub fn messages_to_prompt(req: &ChatRequest) -> AppResult<String> {
     } else {
         Ok(format!("{}\n\n{}", system.join("\n"), history))
     }
+}
+
+/// 渲染单个消息为转录行（含工具调用/结果）。
+fn render_turn(m: &Message) -> String {
+    if m.role == "tool" {
+        // 工具结果：带调用 id 便于模型关联
+        let id = m.tool_call_id.as_deref().unwrap_or("");
+        return format!("tool_result(id={}): {}", id, m.text());
+    }
+    let text = m.text();
+    if let Some(tcs) = &m.tool_calls {
+        // 助手的工具调用：渲染为 tool 块，与模型输出格式一致（便于模型继续）
+        let mut s = String::new();
+        if !text.trim().is_empty() {
+            s.push_str(&format!("assistant: {text}\n"));
+        }
+        for tc in tcs {
+            s.push_str(&format!(
+                "```tool\n{{\"name\":\"{}\",\"arguments\":{}}}\n```\n",
+                tc.function.name,
+                normalize_args(&tc.function.arguments)
+            ));
+        }
+        return s.trim_end().to_string();
+    }
+    format!("{}: {}", m.role, text)
+}
+
+/// 把工具调用参数字符串规整为 JSON（OpenAI 约定 arguments 是 JSON 字符串）。
+fn normalize_args(args: &str) -> String {
+    match serde_json::from_str::<serde_json::Value>(args) {
+        Ok(v) => v.to_string(),
+        Err(_) => "{}".to_string(),
+    }
+}
+
+/// 把请求里的工具定义转换为 `tools::ToolDef`。
+pub fn tool_defs(req: &ChatRequest) -> Vec<crate::tools::ToolDef> {
+    req.tools
+        .as_deref()
+        .unwrap_or(&[])
+        .iter()
+        .map(|t| crate::tools::ToolDef {
+            name: t.function.name.clone(),
+            description: t.function.description.clone(),
+            parameters: t.function.parameters.clone(),
+        })
+        .collect()
 }
 
 // ── 响应 ────────────────────────────────────────────────
@@ -144,6 +234,28 @@ pub struct Delta {
     pub role: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
+    /// v2.0.0：流式工具调用增量（OpenAI 结构）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCallDelta>>,
+}
+
+/// 流式工具调用增量。
+#[derive(Debug, Clone, Serialize)]
+pub struct ToolCallDelta {
+    pub index: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    pub function: ToolCallDeltaFunction,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ToolCallDeltaFunction {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub arguments: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -166,6 +278,9 @@ pub struct CompletionChoice {
 pub struct AssistantMessage {
     pub role: String,
     pub content: String,
+    /// v2.0.0：非流式工具调用（OpenAI 结构）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCallMsg>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -203,7 +318,7 @@ pub fn first_chunk(id: &str, model: &str) -> ChatChunk {
             index: 0,
             delta: Delta {
                 role: Some("assistant".into()),
-                content: None,
+                ..Default::default()
             },
             finish_reason: None,
         }],
@@ -219,8 +334,8 @@ pub fn content_chunk(id: &str, model: &str, content: &str) -> ChatChunk {
         choices: vec![ChunkChoice {
             index: 0,
             delta: Delta {
-                role: None,
                 content: Some(content.to_string()),
+                ..Default::default()
             },
             finish_reason: None,
         }],
@@ -228,6 +343,11 @@ pub fn content_chunk(id: &str, model: &str, content: &str) -> ChatChunk {
 }
 
 pub fn stop_chunk(id: &str, model: &str) -> ChatChunk {
+    stop_chunk_reason(id, model, "stop")
+}
+
+/// 带指定 finish_reason 的结束 chunk（v2.0.0：`tool_calls` 场景）。
+pub fn stop_chunk_reason(id: &str, model: &str, reason: &str) -> ChatChunk {
     ChatChunk {
         id: id.to_string(),
         object: "chat.completion.chunk".into(),
@@ -236,7 +356,40 @@ pub fn stop_chunk(id: &str, model: &str) -> ChatChunk {
         choices: vec![ChunkChoice {
             index: 0,
             delta: Delta::default(),
-            finish_reason: Some("stop".into()),
+            finish_reason: Some(reason.into()),
+        }],
+    }
+}
+
+/// v2.0.0：构造一次工具调用的流式增量 chunk（含完整参数）。
+pub fn tool_call_chunk(
+    id: &str,
+    model: &str,
+    index: u32,
+    call_id: &str,
+    name: &str,
+    arguments: &str,
+) -> ChatChunk {
+    ChatChunk {
+        id: id.to_string(),
+        object: "chat.completion.chunk".into(),
+        created: now_secs(),
+        model: model.to_string(),
+        choices: vec![ChunkChoice {
+            index: 0,
+            delta: Delta {
+                tool_calls: Some(vec![ToolCallDelta {
+                    index,
+                    id: Some(call_id.to_string()),
+                    kind: Some("function".into()),
+                    function: ToolCallDeltaFunction {
+                        name: Some(name.to_string()),
+                        arguments: Some(arguments.to_string()),
+                    },
+                }]),
+                ..Default::default()
+            },
+            finish_reason: None,
         }],
     }
 }
@@ -319,6 +472,8 @@ mod tests {
         Message {
             role: role.into(),
             content: Some(Content::Text(text.into())),
+            tool_calls: None,
+            tool_call_id: None,
         }
     }
 
@@ -331,6 +486,8 @@ mod tests {
             temperature: None,
             max_tokens: None,
             user: None,
+            tools: None,
+            tool_choice: None,
         };
         assert_eq!(messages_to_prompt(&req).unwrap(), "hello");
     }
@@ -344,6 +501,8 @@ mod tests {
             temperature: None,
             max_tokens: None,
             user: None,
+            tools: None,
+            tool_choice: None,
         };
         assert_eq!(messages_to_prompt(&req).unwrap(), "be brief\n\nhi");
     }
@@ -362,6 +521,8 @@ mod tests {
             temperature: None,
             max_tokens: None,
             user: None,
+            tools: None,
+            tool_choice: None,
         };
         let p = messages_to_prompt(&req).unwrap();
         assert!(
@@ -379,6 +540,8 @@ mod tests {
             temperature: None,
             max_tokens: None,
             user: None,
+            tools: None,
+            tool_choice: None,
         };
         assert!(messages_to_prompt(&req).is_err());
     }
@@ -489,6 +652,8 @@ mod tests {
             temperature: None,
             max_tokens: None,
             user: None,
+            tools: None,
+            tool_choice: None,
         };
         let p = messages_to_prompt(&req).unwrap();
         assert!(p.contains("我叫小明"), "首轮 user 丢失: {p}");
@@ -506,6 +671,8 @@ mod tests {
             temperature: None,
             max_tokens: None,
             user: None,
+            tools: None,
+            tool_choice: None,
         };
         let p = messages_to_prompt(&req).unwrap();
         assert!(p.contains("user: A") || p.contains("A"), "{p}");
@@ -528,6 +695,8 @@ mod tests {
             temperature: None,
             max_tokens: None,
             user: None,
+            tools: None,
+            tool_choice: None,
         };
         assert_eq!(messages_to_prompt(&req).unwrap(), "hello");
     }
@@ -546,9 +715,128 @@ mod tests {
             temperature: None,
             max_tokens: None,
             user: None,
+            tools: None,
+            tool_choice: None,
         };
         let p = messages_to_prompt(&req).unwrap();
         assert!(p.starts_with("be brief"), "system 应在最前: {p}");
         assert!(p.contains('A') && p.contains('B') && p.contains('C'), "{p}");
+    }
+
+    // ── v2.0.0 工具调用：请求解析 ─────────────────────────────
+
+    fn tool_msg(role: &str, text: &str) -> Message {
+        Message {
+            role: role.into(),
+            content: Some(Content::Text(text.into())),
+            tool_calls: None,
+            tool_call_id: None,
+        }
+    }
+
+    #[test]
+    fn tools_deserialized() {
+        let raw = r#"{
+            "model":"deepseek-es",
+            "messages":[{"role":"user","content":"hi"}],
+            "tools":[{"type":"function","function":{"name":"get_weather","description":"查天气","parameters":{"type":"object","properties":{"city":{"type":"string"}}}}}]
+        }"#;
+        let req: ChatRequest = serde_json::from_str(raw).unwrap();
+        let defs = tool_defs(&req);
+        assert_eq!(defs.len(), 1);
+        assert_eq!(defs[0].name, "get_weather");
+        assert_eq!(defs[0].description.as_deref(), Some("查天气"));
+    }
+
+    #[test]
+    fn no_tools_gives_empty_defs() {
+        let req = ChatRequest {
+            model: None,
+            messages: vec![msg("user", "hi")],
+            stream: None,
+            temperature: None,
+            max_tokens: None,
+            user: None,
+            tools: None,
+            tool_choice: None,
+        };
+        assert!(tool_defs(&req).is_empty());
+    }
+
+    #[test]
+    fn tool_result_message_rendered_into_prompt() {
+        // role:"tool" 消息必须进入转录（模型据此看到工具返回值）
+        let req = ChatRequest {
+            model: None,
+            messages: vec![
+                tool_msg("user", "北京天气？"),
+                Message {
+                    role: "assistant".into(),
+                    content: None,
+                    tool_calls: Some(vec![ToolCallMsg {
+                        id: "call_1".into(),
+                        kind: Some("function".into()),
+                        function: ToolCallFunction {
+                            name: "get_weather".into(),
+                            arguments: r#"{"city":"北京"}"#.into(),
+                        },
+                    }]),
+                    tool_call_id: None,
+                },
+                Message {
+                    role: "tool".into(),
+                    content: Some(Content::Text("晴 25°C".into())),
+                    tool_calls: None,
+                    tool_call_id: Some("call_1".into()),
+                },
+            ],
+            stream: None,
+            temperature: None,
+            max_tokens: None,
+            user: None,
+            tools: None,
+            tool_choice: None,
+        };
+        let p = messages_to_prompt(&req).unwrap();
+        assert!(p.contains("get_weather"), "工具调用名应出现: {p}");
+        assert!(p.contains("北京"), "工具参数应出现: {p}");
+        assert!(p.contains("晴 25°C"), "工具结果应出现: {p}");
+    }
+
+    #[test]
+    fn tool_only_message_is_valid_input() {
+        // 只有 tool 消息（无 user）也应可解析（工具回传场景）
+        let req = ChatRequest {
+            model: None,
+            messages: vec![Message {
+                role: "tool".into(),
+                content: Some(Content::Text("结果".into())),
+                tool_calls: None,
+                tool_call_id: Some("call_1".into()),
+            }],
+            stream: None,
+            temperature: None,
+            max_tokens: None,
+            user: None,
+            tools: None,
+            tool_choice: None,
+        };
+        assert!(messages_to_prompt(&req).is_ok());
+    }
+
+    #[test]
+    fn tool_call_chunk_serialization() {
+        let c = tool_call_chunk("id", "m", 0, "call_abc", "get_weather", "{\"city\":\"x\"}");
+        let s = serde_json::to_string(&c).unwrap();
+        assert!(s.contains("\"tool_calls\""), "{s}");
+        assert!(s.contains("\"name\":\"get_weather\""), "{s}");
+        assert!(s.contains("\"index\":0"), "{s}");
+    }
+
+    #[test]
+    fn stop_chunk_reason_tool_calls() {
+        let c = stop_chunk_reason("id", "m", "tool_calls");
+        let s = serde_json::to_string(&c).unwrap();
+        assert!(s.contains("\"finish_reason\":\"tool_calls\""), "{s}");
     }
 }

@@ -193,12 +193,21 @@ async fn openai_chat(
         .unwrap_or_else(|| DEFAULT_MODEL.to_string());
     let meta = models::resolve_model(&model_id, &state.cfg.default_model);
     let raw_prompt = oai::messages_to_prompt(&req)?;
-    // P3-6 + H4：语言/风格指令 + 伪工具说明注入
-    let prompt = features::inject_prompt_prefixes(
-        &raw_prompt,
-        &state.cfg.system_prompt_suffix,
-        state.cfg.pseudo_tools_enabled,
-    );
+    // v2.0.0：协议级工具——客户端声明了 tools 则注入工具说明（由客户端执行工具）
+    let tool_defs = oai::tool_defs(&req);
+    let prompt = if let Some(tp) = crate::tools::render_tool_prompt(&tool_defs) {
+        // 协议级工具模式：工具说明 + （可选）语言指令
+        let base =
+            features::inject_prompt_prefixes(&raw_prompt, &state.cfg.system_prompt_suffix, false);
+        format!("{tp}\n\n{base}")
+    } else {
+        // P3-6 + H4：语言/风格指令 + 伪工具说明注入
+        features::inject_prompt_prefixes(
+            &raw_prompt,
+            &state.cfg.system_prompt_suffix,
+            state.cfg.pseudo_tools_enabled,
+        )
+    };
     let stream = req.stream.unwrap_or(false);
     // P3-7：伪工具说明注入（仅当启用且非流式时提示模型可调用）
     let cache_key = ResponseCache::key(&model_id, &prompt);
@@ -272,50 +281,101 @@ async fn openai_chat(
         // M7 收尾链需要 id/model（map 闭包会 move 走，故先克隆）
         let id_m7 = id.clone();
         let model_m7 = model.clone();
+        // v2.0.0：工具模式下的流式 hold-back 过滤器
+        let tool_mode = !tool_defs.is_empty();
+        let mut filter = crate::tools::StreamToolFilter::new();
         let out = head
-            .chain(events.map(move |item| -> Result<Event, Infallible> {
+            .chain(
+                events
+                    .map(move |item| -> Vec<Result<Event, Infallible>> {
                 let ev = match item {
                     Ok(t) => t,
                     Err(e) => oai::Translated::Error(e.to_string()),
                 };
-                let (data, is_done) = match ev {
+                let mut evs: Vec<Result<Event, Infallible>> = Vec::new();
+                let mut push_data = |data: String| {
+                    let seq = replay_body.push(&rid_body, format!("data: {data}"));
+                    evs.push(Ok(Event::default().id(seq.to_string()).data(data)));
+                };
+                match ev {
                     oai::Translated::Delta(text) => {
                         acc_c.fetch_add(text.chars().count(), std::sync::atomic::Ordering::Relaxed);
-                        (
-                            serde_json::to_string(&oai::content_chunk(&id, &model, &text)).unwrap(),
-                            false,
-                        )
+                        if tool_mode {
+                            // hold-back：只放行工具块之外的文本
+                            if let crate::tools::FilterOut::Text(t) = filter.push(&text) {
+                                if !t.is_empty() {
+                                    let data =
+                                        serde_json::to_string(&oai::content_chunk(&id, &model, &t))
+                                            .unwrap();
+                                    push_data(data);
+                                }
+                            }
+                        } else {
+                            let data =
+                                serde_json::to_string(&oai::content_chunk(&id, &model, &text)).unwrap();
+                            push_data(data);
+                        }
                     }
                     oai::Translated::Done => {
                         fin_o.store(true, std::sync::atomic::Ordering::Relaxed);
-                        (
-                            serde_json::to_string(&oai::stop_chunk(&id, &model)).unwrap(),
-                            true,
-                        )
+                        if tool_mode {
+                            // 取出暂扣文本 + 解析出的工具调用
+                            let (tail, calls) = filter.push_finish();
+                            if !tail.is_empty() {
+                                let data = serde_json::to_string(&oai::content_chunk(
+                                    &id, &model, &tail,
+                                ))
+                                .unwrap();
+                                push_data(data);
+                            }
+                            for (i, inv) in calls.iter().enumerate() {
+                                let data = serde_json::to_string(&oai::tool_call_chunk(
+                                    &id,
+                                    &model,
+                                    i as u32,
+                                    &inv.id,
+                                    &inv.name,
+                                    &inv.arguments.to_string(),
+                                ))
+                                .unwrap();
+                                push_data(data);
+                            }
+                            let reason = if calls.is_empty() { "stop" } else { "tool_calls" };
+                            let data =
+                                serde_json::to_string(&oai::stop_chunk_reason(&id, &model, reason))
+                                    .unwrap();
+                            push_data(data);
+                            replay_body.finish(&rid_body);
+                        } else {
+                            let data = serde_json::to_string(&oai::stop_chunk(&id, &model)).unwrap();
+                            let seq = replay_body.push(&rid_body, format!("data: {data}"));
+                            evs.push(Ok(Event::default().id(seq.to_string()).data(data)));
+                            replay_body.finish(&rid_body);
+                        }
                     }
-                    oai::Translated::Error(e) => (
-                        serde_json::json!({"error":{"message":e,"type":"upstream_error"}})
-                            .to_string(),
-                        false,
-                    ),
-                    oai::Translated::Quota(m) => (
-                        serde_json::json!({"error":{"message":m,"type":"rate_limit_error"}})
-                            .to_string(),
-                        false,
-                    ),
+                    oai::Translated::Error(e) => {
+                        let data =
+                            serde_json::json!({"error":{"message":e,"type":"upstream_error"}})
+                                .to_string();
+                        push_data(data);
+                    }
+                    oai::Translated::Quota(m) => {
+                        let data =
+                            serde_json::json!({"error":{"message":m,"type":"rate_limit_error"}})
+                                .to_string();
+                        push_data(data);
+                    }
                     // M3：中途要求安全校验——发结构化错误（不泄漏哨兵字符串）
-                    oai::Translated::TsRequired => (
-                        serde_json::json!({"error":{"message":"上游要求重新安全校验，请重试","type":"api_error"}})
-                            .to_string(),
-                        false,
-                    ),
-                };
-                let seq = replay_body.push(&rid_body, format!("data: {data}"));
-                if is_done {
-                    replay_body.finish(&rid_body);
+                    oai::Translated::TsRequired => {
+                        let data = serde_json::json!({"error":{"message":"上游要求重新安全校验，请重试","type":"api_error"}}).to_string();
+                        push_data(data);
+                    }
                 }
-                Ok(Event::default().id(seq.to_string()).data(data))
-            }))
+                evs
+                    })
+                    .map(futures::stream::iter)
+                    .flatten(),
+            )
             // M7：上游异常结束（未收到 Done）时补一帧带 finish_reason 的结束块
             .chain(
                 futures::stream::once({
@@ -391,18 +451,40 @@ async fn openai_chat(
             Err(e) => return Err(e),
         }
     }
-    // P3-7：解析伪工具调用 → 本地执行 → 追加结果文本
-    let parsed = features::parse_tool_calls(&full);
-    let final_text = if parsed.calls.is_empty() {
-        full.clone()
-    } else {
-        let mut t = parsed.text.clone();
-        t.push_str("\n\n");
-        for call in &parsed.calls {
-            let r = features::execute_tool(call);
-            t.push_str(&format!("[tool:{}] {}\n", call.name, r));
+    // v2.0.0：协议级工具优先——客户端声明 tools 时，产出标准 tool_calls（由客户端执行）
+    // 否则回退 P3-7 伪工具（网关本地执行并回填文本）。
+    let (final_text, tool_calls, finish_reason) = if !tool_defs.is_empty() {
+        let (text, invocations) = crate::tools::parse_invocations(&full);
+        if invocations.is_empty() {
+            (text, None, "stop".to_string())
+        } else {
+            let calls: Vec<oai::ToolCallMsg> = invocations
+                .iter()
+                .map(|inv| oai::ToolCallMsg {
+                    id: inv.id.clone(),
+                    kind: Some("function".into()),
+                    function: oai::ToolCallFunction {
+                        name: inv.name.clone(),
+                        arguments: inv.arguments.to_string(),
+                    },
+                })
+                .collect();
+            (text, Some(calls), "tool_calls".to_string())
         }
-        t.trim().to_string()
+    } else {
+        let parsed = features::parse_tool_calls(&full);
+        let t = if parsed.calls.is_empty() {
+            full.clone()
+        } else {
+            let mut t = parsed.text.clone();
+            t.push_str("\n\n");
+            for call in &parsed.calls {
+                let r = features::execute_tool(call);
+                t.push_str(&format!("[tool:{}] {}\n", call.name, r));
+            }
+            t.trim().to_string()
+        };
+        (t, None, "stop".to_string())
     };
 
     // P3-2：写入缓存
@@ -437,8 +519,9 @@ async fn openai_chat(
             message: oai::AssistantMessage {
                 role: "assistant".into(),
                 content: final_text,
+                tool_calls,
             },
-            finish_reason: "stop".into(),
+            finish_reason,
         }],
         usage: oai::Usage {
             prompt_tokens: pt,
@@ -469,6 +552,7 @@ fn chat_completion(model: &str, content: String, prompt: &str) -> oai::ChatCompl
             message: oai::AssistantMessage {
                 role: "assistant".into(),
                 content,
+                tool_calls: None,
             },
             finish_reason: "stop".into(),
         }],
@@ -609,11 +693,20 @@ async fn anthropic_messages_inner(
         .clone()
         .unwrap_or_else(|| DEFAULT_MODEL.to_string());
     let meta = models::resolve_model(&model_id, &state.cfg.default_model);
-    let prompt = features::inject_prompt_prefixes(
-        &anth::messages_to_prompt(&req).map_err(AppError::BadRequest)?,
-        &state.cfg.system_prompt_suffix,
-        state.cfg.pseudo_tools_enabled,
-    );
+    // v2.0.0：协议级工具——客户端声明 tools 则注入工具说明（由客户端执行）
+    let tool_defs = anth::tool_defs(&req);
+    let raw_prompt = anth::messages_to_prompt(&req).map_err(AppError::BadRequest)?;
+    let prompt = if let Some(tp) = crate::tools::render_tool_prompt(&tool_defs) {
+        let base =
+            features::inject_prompt_prefixes(&raw_prompt, &state.cfg.system_prompt_suffix, false);
+        format!("{tp}\n\n{base}")
+    } else {
+        features::inject_prompt_prefixes(
+            &raw_prompt,
+            &state.cfg.system_prompt_suffix,
+            state.cfg.pseudo_tools_enabled,
+        )
+    };
     let stream = req.stream.unwrap_or(false);
 
     let session_key = headers
@@ -641,6 +734,9 @@ async fn anthropic_messages_inner(
         let block_open = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let block_open_c = block_open.clone();
         let prompt_tokens_c = prompt_tokens;
+        // v2.0.0：工具模式下的流式 hold-back 过滤器（Anthropic 侧）
+        let anth_tool_mode = !tool_defs.is_empty();
+        let mut anth_filter = crate::tools::StreamToolFilter::new();
         let out = events.flat_map(move |item| {
             let model = model.clone();
             let msg_id = msg_id.clone();
@@ -669,42 +765,115 @@ async fn anthropic_messages_inner(
             match item {
                 Ok(oai::Translated::Delta(text)) => {
                     out_c.fetch_add(text.chars().count(), std::sync::atomic::Ordering::Relaxed);
-                    if !block_started {
-                        block_started = true;
-                        block_open_c.store(true, std::sync::atomic::Ordering::Relaxed);
-                        let cbs = anth::ContentBlockStart {
-                            kind: anth::SSE_EVENT_CONTENT_BLOCK_START,
+                    // 工具模式：hold-back，只放行工具块之外文本
+                    let emit_text = if anth_tool_mode {
+                        match anth_filter.push(&text) {
+                            crate::tools::FilterOut::Text(t) => t,
+                            crate::tools::FilterOut::Hold => String::new(),
+                        }
+                    } else {
+                        text
+                    };
+                    if !emit_text.is_empty() {
+                        if !block_started {
+                            block_started = true;
+                            block_open_c.store(true, std::sync::atomic::Ordering::Relaxed);
+                            let cbs = anth::ContentBlockStart {
+                                kind: anth::SSE_EVENT_CONTENT_BLOCK_START,
+                                index: 0,
+                                content_block: anth::ContentBlock::text(""),
+                            };
+                            evs.push(Ok(sse_named(anth::SSE_EVENT_CONTENT_BLOCK_START, &cbs)));
+                        }
+                        let cbd = anth::ContentBlockDelta {
+                            kind: anth::SSE_EVENT_CONTENT_BLOCK_DELTA,
                             index: 0,
-                            content_block: anth::ContentBlock {
-                                kind: "text",
-                                text: String::new(),
+                            delta: anth::TextDelta {
+                                kind: "text_delta",
+                                text: emit_text,
                             },
                         };
-                        evs.push(Ok(sse_named(anth::SSE_EVENT_CONTENT_BLOCK_START, &cbs)));
+                        evs.push(Ok(sse_named(anth::SSE_EVENT_CONTENT_BLOCK_DELTA, &cbd)));
                     }
-                    let cbd = anth::ContentBlockDelta {
-                        kind: anth::SSE_EVENT_CONTENT_BLOCK_DELTA,
-                        index: 0,
-                        delta: anth::TextDelta {
-                            kind: "text_delta",
-                            text,
-                        },
-                    };
-                    evs.push(Ok(sse_named(anth::SSE_EVENT_CONTENT_BLOCK_DELTA, &cbd)));
                 }
                 Ok(oai::Translated::Done) => {
                     fin_c.store(true, std::sync::atomic::Ordering::Relaxed);
+                    // 工具模式：冲掉暂扣文本 + 产出 tool_use 块
+                    let tool_calls = if anth_tool_mode {
+                        let (tail, calls) = anth_filter.push_finish();
+                        if !tail.is_empty() {
+                            if !block_started {
+                                block_started = true;
+                                block_open_c.store(true, std::sync::atomic::Ordering::Relaxed);
+                                let cbs = anth::ContentBlockStart {
+                                    kind: anth::SSE_EVENT_CONTENT_BLOCK_START,
+                                    index: 0,
+                                    content_block: anth::ContentBlock::text(""),
+                                };
+                                evs.push(Ok(sse_named(anth::SSE_EVENT_CONTENT_BLOCK_START, &cbs)));
+                            }
+                            let cbd = anth::ContentBlockDelta {
+                                kind: anth::SSE_EVENT_CONTENT_BLOCK_DELTA,
+                                index: 0,
+                                delta: anth::TextDelta {
+                                    kind: "text_delta",
+                                    text: tail,
+                                },
+                            };
+                            evs.push(Ok(sse_named(anth::SSE_EVENT_CONTENT_BLOCK_DELTA, &cbd)));
+                        }
+                        calls
+                    } else {
+                        Vec::new()
+                    };
                     if block_started {
                         let cbs = anth::ContentBlockStop {
                             kind: anth::SSE_EVENT_CONTENT_BLOCK_STOP,
                             index: 0,
                         };
                         evs.push(Ok(sse_named(anth::SSE_EVENT_CONTENT_BLOCK_STOP, &cbs)));
+                        block_open_c.store(false, std::sync::atomic::Ordering::Relaxed);
                     }
+                    // 每个工具调用产出独立 content_block（tool_use）
+                    for (i, inv) in tool_calls.iter().enumerate() {
+                        let idx = (i + 1) as u32;
+                        let cbs = anth::ContentBlockStart {
+                            kind: anth::SSE_EVENT_CONTENT_BLOCK_START,
+                            index: idx,
+                            content_block: anth::ContentBlock::tool_use(
+                                inv.id.clone(),
+                                inv.name.clone(),
+                                serde_json::json!({}),
+                            ),
+                        };
+                        evs.push(Ok(sse_named(anth::SSE_EVENT_CONTENT_BLOCK_START, &cbs)));
+                        // 参数一次性以 input_json_delta 发出（简化，客户端会累积）
+                        let ijd = serde_json::json!({
+                            "type": "content_block_delta",
+                            "index": idx,
+                            "delta": {
+                                "type": "input_json_delta",
+                                "partial_json": inv.arguments.to_string(),
+                            }
+                        });
+                        evs.push(Ok(Event::default()
+                            .event(anth::SSE_EVENT_CONTENT_BLOCK_DELTA)
+                            .data(ijd.to_string())));
+                        let cbe = anth::ContentBlockStop {
+                            kind: anth::SSE_EVENT_CONTENT_BLOCK_STOP,
+                            index: idx,
+                        };
+                        evs.push(Ok(sse_named(anth::SSE_EVENT_CONTENT_BLOCK_STOP, &cbe)));
+                    }
+                    let stop_reason = if tool_calls.is_empty() {
+                        "end_turn"
+                    } else {
+                        "tool_use"
+                    };
                     let md = anth::MessageDelta {
                         kind: anth::SSE_EVENT_MESSAGE_DELTA,
                         delta: anth::DeltaStop {
-                            stop_reason: "end_turn".into(),
+                            stop_reason: stop_reason.into(),
                             stop_sequence: None,
                         },
                         usage: anth::AnthropicUsage {
@@ -844,13 +1013,43 @@ async fn anthropic_messages_inner(
             Err(e) => return Err(e),
         }
     }
+    // v2.0.0：协议级工具优先——声明 tools 时产出标准 tool_use 块
+    let (content, stop_reason) = if !tool_defs.is_empty() {
+        let (text, invocations) = crate::tools::parse_invocations(&full);
+        let mut blocks: Vec<serde_json::Value> = Vec::new();
+        if !text.trim().is_empty() {
+            blocks.push(serde_json::json!({"type":"text","text":text}));
+        }
+        for inv in &invocations {
+            blocks.push(serde_json::json!({
+                "type": "tool_use",
+                "id": inv.id,
+                "name": inv.name,
+                "input": inv.arguments,
+            }));
+        }
+        if blocks.is_empty() {
+            blocks.push(serde_json::json!({"type":"text","text":full}));
+        }
+        let sr = if invocations.is_empty() {
+            "end_turn"
+        } else {
+            "tool_use"
+        };
+        (blocks, sr)
+    } else {
+        (
+            vec![serde_json::json!({"type": "text", "text": full})],
+            "end_turn",
+        )
+    };
     let body = serde_json::json!({
         "id": id,
         "type": "message",
         "role": "assistant",
         "model": model_id,
-        "content": [{"type": "text", "text": full}],
-        "stop_reason": "end_turn",
+        "content": content,
+        "stop_reason": stop_reason,
         "stop_sequence": null,
         "usage": {"input_tokens": estimate_tokens(&prompt), "output_tokens": estimate_tokens(&full)},
     });

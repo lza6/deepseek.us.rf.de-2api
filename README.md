@@ -106,8 +106,20 @@ claude
 | **多 solver 负载均衡** | `solver_urls` | 轮询 + 健康探测 + 故障转移；空则用 `cf_solver_url` |
 | **语言注入** | `system_prompt_suffix` | 追加 system 指令（如"用用户语言回答"） |
 | **多轮对话** | — | 客户端发送的完整消息历史会被渲染进 prompt（见下） |
-| **伪工具调用** | `pseudo_tools_enabled` | 启用后向模型注入工具说明；模型输出 ` ```tool ` JSON 块 → 网关本地执行并回填 |
+| **工具调用** | — | 协议级 `tools`/`tool_calls`（OpenAI）与 `tools`/`tool_use`（Anthropic），见下 |
+| **伪工具调用** | `pseudo_tools_enabled` | 网关**本地执行**工具（与上面「工具调用」不同，见下） |
 | **断线重放** | — | SSE 事件带 `id:`；见下方限制说明 |
+
+> **工具调用（协议级，v0.7.0）**：客户端在请求里传 `tools` 即启用。上游虽**不支持原生
+> function calling**，网关通过「注入工具说明 → 解析模型输出的 ` ```tool ` 块 → 产出标准协议结构」
+> 实现：OpenAI 返回 `choices[].message.tool_calls` + `finish_reason:"tool_calls"`；
+> Anthropic 返回 `content[].type=="tool_use"` + `stop_reason:"tool_use"`。
+> 客户端回传结果（OpenAI `role:"tool"` / Anthropic `tool_result`）会被转成 prompt 供模型续答。
+> 流式支持：`delta.tool_calls`（OpenAI）/ `input_json_delta`（Anthropic），工具块内容不会泄漏到文本流。
+
+> **伪工具调用（网关注入，与上不同）**：`pseudo_tools_enabled=true` 时，网关注入内置工具说明
+> （`get_time`/`echo`）并**在网关本地执行**，结果以文本回填——用于无客户端工具执行能力的场景。
+> 二者互斥：请求含 `tools` 时走协议级工具，否则按 `pseudo_tools_enabled` 决定。
 
 > **多轮对话语义**：上游虽按 `conversation_uuid` 承接历史，但标准 OpenAI/Anthropic 客户端
 > **每轮发送完整历史**，且多数 SDK 默认不设 `user` 字段——此时网关无法稳定映射会话，

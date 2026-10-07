@@ -24,6 +24,7 @@ pub mod protocol;
 pub mod replay;
 pub mod session;
 pub mod solver;
+pub mod tools;
 pub mod upstream;
 
 pub use config::Config;
