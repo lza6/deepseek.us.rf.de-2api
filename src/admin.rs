@@ -108,13 +108,21 @@ pub async fn admin_status(
             "bot_id": state.cfg.bot_id,
             "authed": state.upstream.is_authed_cached(),
         },
+        // 6.4：运行时内部状态（可观测性）
+        "runtime": {
+            "cache_entries": state.cache.len(),
+            "replay_responses": state.replay.len(),
+            "breaker": state.upstream.breaker_state(),
+        },
         "config": {
             "api_keys": state.cfg.api_keys.len(),
             "cache_ttl_secs": state.cfg.cache_ttl_secs,
             "ledger_enabled": state.ledger.enabled(),
+            "ledger_retention_days": state.cfg.ledger_retention_days,
             "solvers": state.upstream.solver_count(),
             "rate_limit_per_sec": state.cfg.rate_limit_per_sec,
             "max_concurrency": state.cfg.max_concurrency,
+            "max_request_bytes": state.cfg.max_request_bytes,
         },
         "stats": stats,
         "recent": recent,

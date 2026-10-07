@@ -924,8 +924,17 @@ async fn anthropic_messages_inner(
             let model = model.clone();
             let msg_id = msg_id.clone();
             let mut evs: Vec<Result<Event, Infallible>> = Vec::new();
+            // L5：若**首事件即为错误**（Error/Quota/TsRequired），不应先发 message_start
+            // —— 否则客户端收到一个「已开始的正常消息」紧接错误帧，语义矛盾。
+            let is_err_item = matches!(
+                &item,
+                Ok(oai::Translated::Error(_))
+                    | Ok(oai::Translated::Quota(_))
+                    | Ok(oai::Translated::TsRequired)
+                    | Err(_)
+            );
             // 首帧 message_start + content_block_start
-            if !state_started {
+            if !state_started && !is_err_item {
                 state_started = true;
                 let ms = anth::MessageStartEvent {
                     kind: anth::SSE_EVENT_MESSAGE_START,

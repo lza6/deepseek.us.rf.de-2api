@@ -2252,3 +2252,96 @@ async fn anthropic_nonstream_cache_hit() {
     assert_eq!(c1, c2, "缓存命中内容应一致");
     assert!(t1.as_millis() < 200, "缓存命中应很快，实际 {:?}", t1);
 }
+
+// ── L10：错误体 code 与 type 区分 ────────────────────────────
+
+#[tokio::test]
+async fn openai_error_code_differs_from_type() {
+    let base = spawn_gateway().await;
+    let v: serde_json::Value = reqwest::Client::new()
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&serde_json::json!({ "model": "deepseek-es", "messages": [] }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let e = &v["error"];
+    assert_eq!(e["type"], "invalid_request_error", "{v}");
+    assert_eq!(e["code"], "invalid_request", "code 应是更细的机器码: {v}");
+}
+
+/// Anthropic 鉴权失败的 code 也是细粒度（经 into_anthropic_response 时保持 Anthropic 结构）。
+#[tokio::test]
+async fn anthropic_auth_error_shape() {
+    let solver = spawn_mock_solver().await;
+    let cfg = deepseek_es_2api::Config {
+        upstream_base_url: spawn_mock_upstream().await,
+        cf_solver_url: solver,
+        solver_timeout_secs: 10,
+        api_keys: vec!["sk-secret".into()],
+        ..Default::default()
+    };
+    let state = make_state(cfg);
+    let app = deepseek_es_2api::api::build_router(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let base = format!("http://{}", addr);
+    let v: serde_json::Value = reqwest::Client::new()
+        .post(format!("{base}/v1/messages"))
+        .json(&serde_json::json!({
+            "model":"deepseek-es","max_tokens":10,
+            "messages":[{"role":"user","content":"hi"}]
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(v["type"], "error", "{v}");
+    assert_eq!(v["error"]["type"], "authentication_error", "{v}");
+}
+
+// ── 6.4：控制台运行时可观测性 ───────────────────────────────
+
+#[tokio::test]
+async fn admin_status_exposes_runtime_state() {
+    let solver = spawn_mock_solver().await;
+    let cfg = deepseek_es_2api::Config {
+        upstream_base_url: spawn_mock_upstream().await,
+        cf_solver_url: solver,
+        solver_timeout_secs: 10,
+        admin_enabled: true,
+        admin_token: "tok".into(),
+        ..Default::default()
+    };
+    let state = make_state(cfg);
+    let app = deepseek_es_2api::api::build_router(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let base = format!("http://{}", addr);
+    let v: serde_json::Value = reqwest::Client::new()
+        .get(format!("{base}/admin/api/status"))
+        .header("x-admin-token", "tok")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    // 运行时内部状态
+    assert!(v["runtime"]["cache_entries"].is_number(), "{v}");
+    assert!(v["runtime"]["replay_responses"].is_number(), "{v}");
+    assert!(v["runtime"]["breaker"].is_string(), "{v}");
+    // 配置回显（新增项）
+    assert_eq!(v["config"]["ledger_retention_days"], 30, "{v}");
+    assert!(v["config"]["max_request_bytes"].is_number(), "{v}");
+}

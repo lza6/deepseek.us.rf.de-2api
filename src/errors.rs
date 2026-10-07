@@ -48,6 +48,23 @@ impl AppError {
         }
     }
 
+    /// L10：更细的机器可读错误码（区别于粗分类的 `type`）。
+    ///
+    /// OpenAI 规范中 `code` 常为 null 或更具体的标识；此前与 `type` 恒相同。
+    pub fn error_code(&self) -> Option<&'static str> {
+        Some(match self {
+            AppError::BadRequest(_) => "invalid_request",
+            AppError::Unauthorized => "invalid_api_key",
+            AppError::TsRequired => "ts_required",
+            AppError::SolverFailed(_) => "solver_failed",
+            AppError::QuotaExhausted(_) => "quota_exhausted",
+            AppError::Upstream(_) => "upstream_error",
+            AppError::UpstreamStream(_) => "upstream_stream_error",
+            AppError::Network(_) => "network_error",
+            AppError::Internal(_) => "internal_error",
+        })
+    }
+
     /// Anthropic 风格错误类型字符串。
     ///
     /// Anthropic 的合法取值：`invalid_request_error` / `authentication_error` /
@@ -96,13 +113,17 @@ impl AppError {
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         let status = self.status();
-        let body = serde_json::json!({
-            "error": {
-                "message": self.to_string(),
-                "type": self.error_type(),
-                "code": self.error_type(),
-            }
+        // L10：`code` 用更细的机器码（OpenAI 中 `type` 是粗分类、`code` 是细分码），
+        // 此前二者恒相同。`code` 为 None 时按规范可省略。
+        let code = self.error_code();
+        let mut err = serde_json::json!({
+            "message": self.to_string(),
+            "type": self.error_type(),
         });
+        if let Some(c) = code {
+            err["code"] = serde_json::Value::String(c.to_string());
+        }
+        let body = serde_json::json!({ "error": err });
         (status, Json(body)).into_response()
     }
 }

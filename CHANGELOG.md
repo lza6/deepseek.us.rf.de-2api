@@ -2,6 +2,36 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/) 与 [语义化版本](https://semver.org/)。
 
+## [0.12.0] - 2026-10-07
+
+**L 级收尾 + 可观测性**：关闭 L5/L10，落地 §6.4 运行时指标。
+
+### Fixed
+- **L5 · Anthropic 流首帧即错误仍先发 `message_start`**：客户端会收到「已开始的正常消息」紧接错误帧，语义矛盾。
+  修复：首事件即为 `Error`/`Quota`/`TsRequired`/流错误时，**跳过** `message_start`，直接发错误帧。
+- **L10 · 错误体 `code` 与 `type` 恒相同**：OpenAI 规范中 `type` 是粗分类、`code` 是细分机器码。
+  修复：新增 `AppError::error_code()`，`code` 与 `type` 区分（如 `invalid_request_error` / `invalid_request`）。
+  测试：`openai_error_code_differs_from_type`、`anthropic_auth_error_shape`。
+
+### Added
+- **§6.4 运行时可观测性**：`/admin/api/status` 新增 `runtime` 段
+  （`cache_entries` / `replay_responses` / `breaker`：closed|half_open|open），
+  配置回显补 `ledger_retention_days` / `max_request_bytes`。
+  新增 `UpstreamClient::breaker_state()`（非阻塞快照）。
+  测试：`admin_status_exposes_runtime_state`。
+
+### Verified
+- `cargo test --all`：**138 单测 + 56 集成全绿**（较 v0.11.0 新增 3 集成）；fmt / clippy 干净。
+- **真实 E2E（最终二进制，23:47 构建）**：`e2e-v1` **8/8** 通过。
+- **压测**：8 并发 × 24 = **100%**，p50=2040ms、QPS 3.83。
+
+### 未做（如实说明）
+- **L6（流内 `created` 不一致）**、**L9（FNV-1a）**：低价值/低影响，记录于 `TASK-LEDGER.md`。
+- **§6.6 安全加固**（admin 限流、token 哈希）：建议项，未实施，记录于 `TASK-LEDGER.md`。
+- **§6.2 协议族抽象**：结构性重构，风险高收益有限，**不做**。
+
+---
+
 ## [0.11.0] - 2026-10-07
 
 **L 级协议合规修复**（指南 §2.3）：关闭 L3/L4/L7/L8，均为真实客户端会遇到的协议偏差。

@@ -40,12 +40,12 @@
 | L2 | `config()`/`fetch_page_config`/`parse_page_config` 死代码 | ✅ | v0.8.0 已删（grep 确认 0 命中） |
 | L3 | `ChatChunk` 无 usage；不支持 `stream_options.include_usage` | ✅ v0.11.0 | usage_chunk + stream_options |
 | L4 | Anthropic 消息 id 复用 `chatcmpl-` | ✅ v0.11.0 | `to_anthropic_msg_id` |
-| L5 | Anthropic 流首帧即错误仍先发 message_start | ⏳ **待办** | 事件顺序 |
+| L5 | Anthropic 流首帧即错误仍先发 message_start | ✅ v0.12.0 | is_err_item 跳过 |
 | L6 | `now_secs()` 每 chunk 重取，`created` 不一致 | ⏳ **待办** | 流内应固定 created |
 | L7 | `message_delta.usage` 含 `input_tokens` | ✅ v0.11.0 | `OutputUsage` |
 | L8 | Anthropic 端点不走 ResponseCache | ✅ v0.11.0 | 已接入 |
 | L9 | `deterministic_uuid` 用 FNV-1a | ℹ️ 已知 | 影响面小；可改加密哈希 |
-| L10 | 错误体 `code` 与 `type` 恒相同 | ⏳ **待办** | OpenAI 中 code 常更细 |
+| L10 | 错误体 `code` 与 `type` 恒相同 | ✅ v0.12.0 | `error_code()` |
 | L11 | `SolverPool::is_empty`/`SessionStore::is_empty` 零调用 | ✅ 保留 | clippy `len_without_is_empty` 要求成对，非垃圾 |
 | L12 | dev-dep `http-body-util` 未用 | ✅ | v0.8.0 已删（grep 确认 0） |
 
@@ -95,7 +95,7 @@
 | 6.1 | 认证层后台预取 | ✅ v0.6.0 |
 | 6.2 | 协议族抽象（trait Protocol） | ⏳ 待办（结构性重构，低优先） |
 | 6.3 | SSE 字节级状态机 | ✅ v0.4.0（H1 已实现） |
-| 6.4 | 可观测性指标 | ⏳ 部分（`/admin/api/status` 已有基础统计） |
+| 6.4 | 可观测性指标 | ✅ v0.12.0（runtime 段） |
 | 6.5 | 缓存语义化 | ⏳ 部分（cacheable 已有；temperature 未纳入） |
 | 6.6 | 安全加固（admin 限流/token 哈希） | ⏳ 待办 |
 

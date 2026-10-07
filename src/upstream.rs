@@ -127,6 +127,22 @@ impl UpstreamClient {
         }
     }
 
+    /// 6.4：熔断器状态快照（供控制台可观测性）。不阻塞：取不到锁返回 "unknown"。
+    pub fn breaker_state(&self) -> &'static str {
+        match self.breaker.try_lock() {
+            Ok(b) => {
+                if b.open_until.map(|t| Instant::now() < t).unwrap_or(false) {
+                    "open"
+                } else if b.half_open {
+                    "half_open"
+                } else {
+                    "closed"
+                }
+            }
+            Err(_) => "unknown",
+        }
+    }
+
     fn ajax_url(&self) -> String {
         self.cfg.ajax_url()
     }
