@@ -33,6 +33,9 @@ fn default_solver_timeout() -> u64 {
 fn default_http_timeout() -> u64 {
     120
 }
+fn default_connect_timeout() -> u64 {
+    20
+}
 fn default_cookie_ttl() -> u64 {
     // 保守：上游 cookie 实际更长，30 分钟主动刷新
     1800
@@ -113,6 +116,9 @@ pub struct Config {
     /// 上游 HTTP 超时（秒）
     #[serde(default = "default_http_timeout")]
     pub http_timeout_secs: u64,
+    /// 上游连接建立超时（秒）。与总超时分离，避免连接阶段占用全部预算。
+    #[serde(default = "default_connect_timeout")]
+    pub connect_timeout_secs: u64,
     /// cookie 缓存 TTL（秒）
     #[serde(default = "default_cookie_ttl")]
     pub cookie_ttl_secs: u64,
@@ -180,6 +186,7 @@ impl Default for Config {
             proxy: None,
             solver_timeout_secs: default_solver_timeout(),
             http_timeout_secs: default_http_timeout(),
+            connect_timeout_secs: default_connect_timeout(),
             cookie_ttl_secs: default_cookie_ttl(),
             cors_allow_origins: vec![],
             solver_retries: default_solver_retries(),
@@ -257,6 +264,20 @@ impl Config {
         if let Ok(v) = std::env::var("PROXY") {
             if !v.trim().is_empty() {
                 self.proxy = Some(v);
+            }
+        }
+        if let Ok(v) = std::env::var("HTTP_TIMEOUT_SECS") {
+            if let Ok(n) = v.trim().parse::<u64>() {
+                if n > 0 {
+                    self.http_timeout_secs = n;
+                }
+            }
+        }
+        if let Ok(v) = std::env::var("CONNECT_TIMEOUT_SECS") {
+            if let Ok(n) = v.trim().parse::<u64>() {
+                if n > 0 {
+                    self.connect_timeout_secs = n;
+                }
             }
         }
         if let Ok(v) = std::env::var("API_KEYS") {

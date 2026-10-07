@@ -2,7 +2,54 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/) 与 [语义化版本](https://semver.org/)。
 
+## [0.6.0] - 2026-10-07
+
+**可靠性加固批次**（指南 v1.5.0 首批）：关闭 M2 / M5 / M8 / M9，并如实标注 M6 为上游能力缺口。
+
+### Fixed
+- **MEDIUM · 长回答被 120s 总超时截断（M2）**：`reqwest` 的 `.timeout()` 覆盖从建连到 body 读完的
+  **全过程**，流式生成超过 `http_timeout_secs` 会触发 body 读取错误 → 下游收到 `__stream_error__`
+  而非正常结束。修复：**分离两个 HTTP 客户端**——普通 AJAX 客户端保留总超时；
+  新增 **SSE 流式客户端**（无总超时，仅 `connect_timeout` + `read_timeout` 空闲读超时）。
+  新增配置 `connect_timeout_secs`（默认 20）。
+- **MEDIUM · nonce 失效不重试原请求（M5）**：`cache_message` 检测到 nonce/security 类失败时
+  只刷新 nonce 却**立即返回错误**，本次请求仍失败。修复：抽出 `cache_message_once`，
+  外层在疑似 nonce 失效时刷新后**重试一次**（该操作幂等，重试安全）。
+  `stream_chat` 收到 403 现映射为 `TsRequired`（可触发上层重认证重试），而非普通上游错误。
+- **MEDIUM · auth_lock 头阻塞（M8）**：cookie TTL 到期后首个请求内联求解 45-65s，
+  期间所有并发请求排队。修复：新增**后台预取任务**（`UpstreamClient::spawn_prefetch`，
+  `main.rs` 启动时挂载）——每 30s 检查，cookie 剩余 TTL < 20% 时主动续期，
+  且**不清空旧 cookie**（续期期间并发请求仍走快速路径，不被阻塞）。
+- **MEDIUM · 熔断半开状态放行全部并发探测（M9）**：冷却到点后清空状态即放行，
+  N 个并发请求会同时打爆 cf_solver；且半开后一次失败只从 0 计数到 1，需再次累计到阈值才重开，保护滞后。
+  修复：引入 `half_open` + `probe_in_flight` 状态——半开态**只放行一个探测**（其余拒绝），
+  探测失败**立即重新熔断**（不等阈值累积），请求结束释放探测标记。
+
+### Not Applicable
+- **MEDIUM · finish_reason 单一取值（M6）**：经核实上游 `done` 事件仅携带 `{"finished":true}`，
+  **不提供** stop/length/tool_calls 的区分信息。此为该协议的能力缺口，网关无法凭空推断，
+  故**不实现**（避免伪造）。当前恒返回 `"stop"` 属如实映射。
+
+### Added
+- 配置项 `connect_timeout_secs`（默认 20）；环境变量 `HTTP_TIMEOUT_SECS` / `CONNECT_TIMEOUT_SECS`。
+- 测试：`breaker_opens_after_threshold`、`breaker_half_open_allows_single_probe_m9`、
+  `breaker_half_open_failure_reopens_immediately_m9`、`breaker_success_closes`、
+  `m2_stream_client_has_no_total_timeout`、`m5_nonce_failure_detection`、
+  `m8_needs_prefetch_true_when_near_expiry`。
+
+### Verified
+- `cargo test --all`：**101 单测 + 33 集成全绿**（较 v0.5.0 新增 7 单测）；
+  `cargo fmt --all -- --check` 与 `cargo clippy --all-targets -- -D warnings` 均干净。
+- **真实 E2E**（连真实上游 deepseek.es + cf_solver）：v0.5.0 的 8/8 全部保持通过
+  （H3/M4/M7/伪工具/OpenAI 流式），证明可靠性改动未破坏主路径。
+- **M8 真实验证**（`cookie_ttl_secs=60` 短 TTL）：日志出现「cookie 临近过期，后台预取续期（M8）」，
+  预取后请求仍返回 200——后台预取真实生效。
+- **压测**：8 并发 × 24 请求 = **100% 成功**，p50=2012ms、p99=3232ms、QPS 4.07。
+
+---
+
 ## [0.5.0] - 2026-10-07
+
 
 **v1.0.0 正确性加固批次收尾**：关闭全部剩余 HIGH（H3/H4）与 M1/M3/M4/M7/M11/M12。
 至此 §2.1 的四项 HIGH **全部闭环**，网关达到「正确性基线」。

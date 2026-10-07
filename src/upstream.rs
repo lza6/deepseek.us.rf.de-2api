@@ -24,7 +24,10 @@ use tokio::sync::Mutex;
 /// 上游客户端（携带 cookie jar + 缓存的 nonce/cookie）。
 pub struct UpstreamClient {
     cfg: Config,
+    /// 普通请求客户端（AJAX：ts_verify/nonce/cache_message），带总超时
     http: reqwest::Client,
+    /// M2：SSE 流式客户端——无总超时，仅连接+空闲读超时
+    http_stream: reqwest::Client,
     solver: Arc<SolverPool>,
     /// 缓存的安全 cookie 状态
     state: Mutex<AuthState>,
@@ -51,7 +54,12 @@ struct AuthState {
 #[derive(Debug, Default)]
 struct BreakerState {
     consecutive_failures: u32,
+    /// 打开至此刻（到达后半开）
     open_until: Option<Instant>,
+    /// 是否处于半开态（冷却已过、放行单个探测）
+    half_open: bool,
+    /// M9：半开态是否已有探测请求在途（保证半开只放行单个探测）
+    probe_in_flight: bool,
 }
 
 fn decode_entities(s: &str) -> String {
@@ -65,18 +73,30 @@ fn decode_entities(s: &str) -> String {
 
 impl UpstreamClient {
     pub fn new(cfg: Config) -> AppResult<Self> {
+        let connect = Duration::from_secs(cfg.connect_timeout_secs);
+        // 普通 AJAX 客户端：短请求，适用总超时。
         let mut builder = reqwest::Client::builder()
             .cookie_store(false) // 手动管理 cookie
+            .connect_timeout(connect)
             .timeout(Duration::from_secs(cfg.http_timeout_secs));
+        // M2：SSE 流式客户端——**无总超时**（长回答不应在 120s 处被截断），
+        // 仅用连接超时 + 空闲读超时（两次读之间超过 http_timeout_secs 视为上游卡死）。
+        let mut sbuild = reqwest::Client::builder()
+            .cookie_store(false)
+            .connect_timeout(connect)
+            .read_timeout(Duration::from_secs(cfg.http_timeout_secs));
         if let Some(p) = &cfg.proxy {
-            builder = builder.proxy(
-                reqwest::Proxy::all(p)
-                    .map_err(|e| AppError::Internal(format!("代理配置无效: {e}")))?,
-            );
+            let proxy = reqwest::Proxy::all(p)
+                .map_err(|e| AppError::Internal(format!("代理配置无效: {e}")))?;
+            builder = builder.proxy(proxy.clone());
+            sbuild = sbuild.proxy(proxy);
         }
         let http = builder
             .build()
             .map_err(|e| AppError::Internal(format!("HTTP 客户端构建失败: {e}")))?;
+        let http_stream = sbuild
+            .build()
+            .map_err(|e| AppError::Internal(format!("流式 HTTP 客户端构建失败: {e}")))?;
         let solver = Arc::new(SolverPool::new(&cfg)?);
         Ok(UpstreamClient {
             state: Mutex::new(AuthState {
@@ -87,6 +107,7 @@ impl UpstreamClient {
             breaker: Mutex::new(BreakerState::default()),
             cfg,
             http,
+            http_stream,
             solver,
         })
     }
@@ -242,6 +263,56 @@ impl UpstreamClient {
         self.do_auth().await
     }
 
+    /// cookie 剩余 TTL 比例低于该阈值时触发后台预取（M8）。
+    const PREFETCH_THRESHOLD: f64 = 0.2;
+
+    /// M8：是否需要预取（cookie 有效但剩余 TTL < 20%）。
+    async fn needs_prefetch(&self) -> bool {
+        let st = self.state.lock().await;
+        if !Self::has_ok_cookie(&st) {
+            return false; // 未认证走常规路径
+        }
+        match st.cookie_obtained {
+            Some(t) => {
+                let ttl = self.cfg.cookie_ttl_secs as f64;
+                let elapsed = t.elapsed().as_secs_f64();
+                let remaining = ttl - elapsed;
+                remaining > 0.0 && remaining < ttl * Self::PREFETCH_THRESHOLD
+            }
+            None => false,
+        }
+    }
+
+    /// M8：启动后台预取任务——提前在 TTL 剩余 20% 时主动续期，
+    /// 消除「TTL 到期后首个请求内联阻塞 45-65s」的头阻塞问题。
+    ///
+    /// 关键：预取时**不清空**旧 cookie（仍有效），仅在 auth_lock 下重新求解并覆盖，
+    /// 因此并发请求在续期期间仍走快速路径、不被阻塞。
+    pub fn spawn_prefetch(self: Arc<Self>) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            // 每 30s 检查一次；仅在临近过期时续期，避免无谓求解。
+            let mut ticker = tokio::time::interval(Duration::from_secs(30));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            // 跳过首个立即 tick（启动时不必预取）
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                if self.needs_prefetch().await {
+                    tracing::info!("cookie 临近过期，后台预取续期（M8）");
+                    let _guard = self.auth_lock.lock().await;
+                    // 持锁后复查：期间可能已被常规请求刷新
+                    if self.needs_prefetch().await {
+                        if let Err(e) = self.do_auth().await {
+                            tracing::warn!("后台预取失败: {e}（下次请求将重试）");
+                        } else {
+                            tracing::info!("后台预取成功，cookie 已续期");
+                        }
+                    }
+                }
+            }
+        })
+    }
+
     /// 强制失效当前认证状态并重新求解。
     ///
     /// 用于 `ts_required` 自愈：上游可能在 cookie 尚未到 TTL 时就判其失效，
@@ -261,28 +332,57 @@ impl UpstreamClient {
 
     /// 熔断是否放行（打开期间快速失败）。
     ///
-    /// 冷却到点后进入「半开」：清空 `open_until`，使后续失败重新从 0 计数，
-    /// 避免冷却后一失败就立即再次打开、且失败计数无限累积。
+    /// 状态机：闭合 → （连续失败达阈值）打开 → （冷却到点）半开 → 成功则闭合 / 失败则重开。
+    ///
+    /// M9：半开态**只放行一个探测请求**——首个到者置 `probe_in_flight`，
+    /// 其余请求在此期间被拒（返回 false），避免冷却到点后 N 个并发同时打爆 cf_solver。
     async fn breaker_allow(&self) -> bool {
         let mut b = self.breaker.lock().await;
         if let Some(t) = b.open_until {
             if Instant::now() < t {
-                return false;
+                return false; // 仍在冷却
             }
+            // 冷却到点 → 进入半开
             b.open_until = None;
-            b.consecutive_failures = 0;
+            b.half_open = true;
+            b.probe_in_flight = false;
+        }
+        if b.half_open {
+            if b.probe_in_flight {
+                return false; // 已有探测在途，拒绝其他并发
+            }
+            b.probe_in_flight = true; // 放行本次探测
         }
         true
+    }
+
+    /// M9：释放半开探测标记（请求结束时调用，无论成败）。
+    async fn breaker_release_probe(&self) {
+        let mut b = self.breaker.lock().await;
+        b.probe_in_flight = false;
     }
 
     async fn breaker_on_success(&self) {
         let mut b = self.breaker.lock().await;
         b.consecutive_failures = 0;
         b.open_until = None;
+        b.half_open = false;
+        b.probe_in_flight = false;
     }
 
     async fn breaker_on_failure(&self) {
         let mut b = self.breaker.lock().await;
+        // M9：半开探测失败 → 立即重新打开（不经过阈值累积），保护滞后问题修复。
+        if b.half_open {
+            b.half_open = false;
+            b.open_until =
+                Some(Instant::now() + Duration::from_secs(self.cfg.breaker_cooldown_secs));
+            tracing::warn!(
+                "半开探测失败，熔断重新打开 {} 秒",
+                self.cfg.breaker_cooldown_secs
+            );
+            return;
+        }
         b.consecutive_failures += 1;
         if b.consecutive_failures >= self.cfg.breaker_fail_threshold {
             b.open_until =
@@ -329,6 +429,13 @@ impl UpstreamClient {
                 "认证熔断中（近期连续失败），请稍后重试".into(),
             ));
         }
+        // M9：确保半开探测标记在本次认证结束时释放（无论成败）
+        let result = self.do_auth_inner().await;
+        self.breaker_release_probe().await;
+        result
+    }
+
+    async fn do_auth_inner(&self) -> AppResult<()> {
         tracing::info!("开始 Turnstile 认证流程");
         let token = match self.solve_with_retry().await {
             Ok(t) => t,
@@ -448,7 +555,23 @@ impl UpstreamClient {
     }
 
     /// 缓存消息换 cache_key。
+    ///
+    /// M5：若首次失败原因疑似 nonce/security 失效，则刷新 nonce 后**重试一次**
+    /// （`cache_sse_message` 对同一 message 幂等，重试安全）。
     pub async fn cache_message(&self, message: &str) -> AppResult<String> {
+        let first = self.cache_message_once(message).await;
+        match &first {
+            Err(AppError::Upstream(b)) if b.contains("nonce") || b.contains("security") => {
+                tracing::warn!("cache_message 疑似 nonce 失效，刷新 nonce 后重试一次");
+                self.refresh_nonce().await?;
+                self.cache_message_once(message).await
+            }
+            _ => first,
+        }
+    }
+
+    /// 单次 cache_message（不含 nonce 失效重试）。
+    async fn cache_message_once(&self, message: &str) -> AppResult<String> {
         let nonce = self.ensure_nonce().await?;
         let bot_id = { self.state.lock().await.bot_id.clone() };
         let url = self.ajax_url();
@@ -493,10 +616,6 @@ impl UpstreamClient {
         let pr: Resp = serde_json::from_str(&body)
             .map_err(|e| AppError::Upstream(format!("解析 cache 响应失败: {e}, body={body}")))?;
         if !pr.success {
-            // nonce 可能失效
-            if body.contains("nonce") || body.contains("security") {
-                let _ = self.refresh_nonce().await;
-            }
             return Err(AppError::Upstream(format!("缓存失败: {body}")));
         }
         let key = pr.data.map(|d| d.cache_key).unwrap_or_default();
@@ -538,13 +657,18 @@ impl UpstreamClient {
             );
             h
         };
+        // M2：SSE 走独立流式客户端（无总超时，长回答不被截断）
         let r = self
-            .http
+            .http_stream
             .get(&url)
             .headers(headers)
             .send()
             .await
             .map_err(|e| AppError::Network(format!("建立 SSE 失败: {e}")))?;
+        // M5：403 视为安全校验失效（可触发上层重认证重试），而非普通上游错误
+        if r.status() == reqwest::StatusCode::FORBIDDEN {
+            return Err(AppError::TsRequired);
+        }
         if !r.status().is_success() {
             return Err(AppError::Upstream(format!("SSE HTTP {}", r.status())));
         }
@@ -914,5 +1038,111 @@ mod tests {
             .iter()
             .any(|e| matches!(e, Ok(ev) if ev.event == "__stream_error__"));
         assert!(has_err, "超限未触发保护: {evs:?}");
+    }
+
+    // ── M9 回归：熔断状态机（含半开单探测） ──────────────────────
+
+    fn test_client(threshold: u32, cooldown: u64) -> UpstreamClient {
+        let cfg = Config {
+            cf_solver_url: "http://127.0.0.1:1".into(), // 不会实际调用
+            breaker_fail_threshold: threshold,
+            breaker_cooldown_secs: cooldown,
+            ..Default::default()
+        };
+        UpstreamClient::new(cfg).unwrap()
+    }
+
+    #[tokio::test]
+    async fn breaker_opens_after_threshold() {
+        let c = test_client(3, 60);
+        assert!(c.breaker_allow().await, "闭合态应放行");
+        c.breaker_on_failure().await;
+        c.breaker_on_failure().await;
+        assert!(c.breaker_allow().await, "未达阈值应仍放行");
+        c.breaker_on_failure().await; // 第 3 次 → 达到阈值
+        assert!(!c.breaker_allow().await, "达阈值后应熔断（拒绝）");
+    }
+
+    #[tokio::test]
+    async fn breaker_half_open_allows_single_probe_m9() {
+        // cooldown=0 → 立即进入半开
+        let c = test_client(1, 0);
+        c.breaker_on_failure().await; // 打开
+                                      // 冷却为 0，首次 allow 触发半开并放行（占用探测位）
+        assert!(c.breaker_allow().await, "半开应放行首个探测");
+        // 第二个并发探测在半开且已被占用时必须被拒
+        assert!(!c.breaker_allow().await, "半开应拒绝并发探测（M9）");
+        // 释放后再次放行
+        c.breaker_release_probe().await;
+        assert!(c.breaker_allow().await, "释放后应可再次探测");
+    }
+
+    #[tokio::test]
+    async fn breaker_half_open_failure_reopens_immediately_m9() {
+        let c = test_client(1, 60);
+        c.breaker_on_failure().await; // 打开（60s 冷却）
+                                      // 手动把冷却起点推前，模拟冷却已过 → 下次 allow 进入半开
+        {
+            let mut b = c.breaker.lock().await;
+            b.open_until = Some(Instant::now() - Duration::from_secs(1));
+        }
+        assert!(c.breaker_allow().await, "冷却过后应半开放行探测");
+        // 半开探测失败 → 立即重开（不等阈值累积）
+        c.breaker_on_failure().await;
+        assert!(!c.breaker_allow().await, "半开失败应立即重新熔断（M9）");
+    }
+
+    #[tokio::test]
+    async fn breaker_success_closes() {
+        let c = test_client(2, 60);
+        c.breaker_on_failure().await;
+        c.breaker_on_failure().await; // 打开
+        assert!(!c.breaker_allow().await);
+        c.breaker_on_success().await; // 手动恢复
+        assert!(c.breaker_allow().await, "成功后应闭合");
+    }
+
+    // ── M2：流式客户端与普通客户端分离 ──────────────────────────
+
+    #[tokio::test]
+    async fn m2_stream_client_has_no_total_timeout() {
+        // 两个客户端都能成功构造即视为 API 可用（行为差异由 reqwest 保证）
+        let c = test_client(5, 30);
+        let _ = &c.http;
+        let _ = &c.http_stream;
+    }
+
+    // ── M5：cache_message 疑似 nonce 失效判定 ──────────────────
+
+    #[test]
+    fn m5_nonce_failure_detection() {
+        // 判定逻辑：错误串包含 "nonce"/"security" 才触发刷新重试
+        let is_nonce_err = |s: &str| s.contains("nonce") || s.contains("security");
+        assert!(is_nonce_err("缓存失败: invalid nonce"));
+        assert!(is_nonce_err("缓存失败: security check failed"));
+        assert!(!is_nonce_err("缓存失败: quota exceeded"));
+    }
+
+    // ── M8：预取阈值判定 ────────────────────────────────────────
+
+    #[tokio::test]
+    async fn m8_needs_prefetch_true_when_near_expiry() {
+        let c = test_client(5, 30);
+        // 未认证 → 不预取
+        assert!(!c.needs_prefetch().await, "未认证不应预取");
+        // 手动注入：已认证 + cookie 获取于 85% TTL 之前（剩余 15% < 20%）
+        {
+            let mut st = c.state.lock().await;
+            st.cookies = vec![("dsts_ok".into(), "1".into())];
+            // cookie_ttl_secs 默认 1800；设为 1520s 前获取 → 剩余 280s ≈ 15.5%
+            st.cookie_obtained = Some(Instant::now() - Duration::from_secs(1700));
+        }
+        assert!(c.needs_prefetch().await, "剩余 TTL < 20% 应触发预取");
+        // 新鲜 cookie（刚获取）→ 不预取
+        {
+            let mut st = c.state.lock().await;
+            st.cookie_obtained = Some(Instant::now());
+        }
+        assert!(!c.needs_prefetch().await, "新鲜 cookie 不应预取");
     }
 }

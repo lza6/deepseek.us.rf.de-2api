@@ -137,7 +137,8 @@ claude
 | `cf_solver_url` | `http://127.0.0.1:8001` | 求解器地址 |
 | `api_keys` | `[]` | 下游 Key；空 = 仅本机放行 |
 | `proxy` | `null` | 上游出口代理（如 `http://127.0.0.1:10808`） |
-| `cookie_ttl_secs` | `1800` | 安全 cookie 缓存 TTL |
+| `cookie_ttl_secs` | `1800` | 安全 cookie 缓存 TTL（剩余 20% 时后台预取续期） |
+| `connect_timeout_secs` | `20` | 上游连接建立超时（SSE 流无总超时，仅连接 + 空闲读超时） |
 | `cors_allow_origins` | `[]` | CORS；空 = 关闭 |
 | `solver_retries` | `2` | 求解失败重试次数（指数退避） |
 | `breaker_fail_threshold` | `5` | 认证熔断：连续失败阈值 |
@@ -152,9 +153,10 @@ claude
 | `ledger_path` | `usage.db` | SQLite 账本路径（空 = 关闭） |
 | `solver_urls` | `[]` | 多 cf_solver 地址（空则用 `cf_solver_url`） |
 | `system_prompt_suffix` | `""` | 追加的 system 指令（语言/风格） |
+| `pseudo_tools_enabled` | `false` | 启用伪工具（注入工具说明；模型输出 ` ```tool ` 块 → 本地执行） |
 | `max_response_bytes` | `2097152` | 非流式聚合上限（防超大响应） |
 
-环境变量可覆盖：`LISTEN_ADDR` `UPSTREAM_BASE_URL` `BOT_ID` `SITEKEY` `CF_SOLVER_URL` `API_KEYS` `PROXY` `DEFAULT_MODEL` `CORS_ALLOW_ORIGINS`
+环境变量可覆盖：`LISTEN_ADDR` `UPSTREAM_BASE_URL` `BOT_ID` `SITEKEY` `CF_SOLVER_URL` `API_KEYS` `PROXY` `DEFAULT_MODEL` `CORS_ALLOW_ORIGINS` `HTTP_TIMEOUT_SECS` `CONNECT_TIMEOUT_SECS`
 
 > **安全**：监听地址为**非回环**（如 `0.0.0.0`）且 `api_keys` 为空时，网关**拒绝启动**（fail-fast）。确需无鉴权暴露公网须显式设置 `ALLOW_INSECURE_PUBLIC=1`（危险）。
 

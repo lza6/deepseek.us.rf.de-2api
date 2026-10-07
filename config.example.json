@@ -10,6 +10,7 @@
   "proxy": null,
   "solver_timeout_secs": 120,
   "http_timeout_secs": 120,
+  "connect_timeout_secs": 20,
   "cookie_ttl_secs": 1800,
   "cors_allow_origins": [],
   "solver_retries": 2,

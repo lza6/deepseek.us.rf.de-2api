@@ -55,6 +55,8 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let upstream = Arc::new(UpstreamClient::new(cfg.clone())?);
+    // M8：后台认证预取（cookie 剩余 TTL < 20% 时主动续期，消除头阻塞）
+    let _prefetch = upstream.clone().spawn_prefetch();
     let ledger = Ledger::open(&cfg.ledger_path)?;
     if ledger.enabled() {
         tracing::info!("用量账本已启用: {}", cfg.ledger_path);
