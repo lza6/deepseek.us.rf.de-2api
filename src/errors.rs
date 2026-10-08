@@ -51,13 +51,17 @@ impl AppError {
     /// L10：更细的机器可读错误码（区别于粗分类的 `type`）。
     ///
     /// OpenAI 规范中 `code` 常为 null 或更具体的标识；此前与 `type` 恒相同。
+    ///
+    /// **向后兼容**：对 `type == "api_error"` 一类的错误（上游/求解/TS），
+    /// 旧版本 `code` 与 `type` 相同。此处返回细分码，但**保持语义可识别**；
+    /// 对客户端只按 `type` 分支的场景无影响（`type` 未变）。
     pub fn error_code(&self) -> Option<&'static str> {
         Some(match self {
-            AppError::BadRequest(_) => "invalid_request",
+            AppError::BadRequest(_) => "invalid_request_error",
             AppError::Unauthorized => "invalid_api_key",
             AppError::TsRequired => "ts_required",
             AppError::SolverFailed(_) => "solver_failed",
-            AppError::QuotaExhausted(_) => "quota_exhausted",
+            AppError::QuotaExhausted(_) => "rate_limit_exceeded",
             AppError::Upstream(_) => "upstream_error",
             AppError::UpstreamStream(_) => "upstream_stream_error",
             AppError::Network(_) => "network_error",

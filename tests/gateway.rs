@@ -2227,30 +2227,52 @@ async fn message_delta_usage_has_no_input_tokens() {
 
 // ── L8：Anthropic 端点接入响应缓存 ───────────────────────────
 
-/// 相同非流式 Anthropic 请求第二次应命中缓存（第二次更快、内容一致）。
+/// L8：相同非流式 Anthropic 请求第二次命中缓存（用上游调用计数判定，避免计时抖动）。
 #[tokio::test]
 async fn anthropic_nonstream_cache_hit() {
-    let base = spawn_gateway().await;
+    let (upstream, seen) = spawn_mock_upstream_recording().await;
+    let solver = spawn_mock_solver().await;
+    let cfg = deepseek_es_2api::Config {
+        upstream_base_url: upstream,
+        cf_solver_url: solver,
+        solver_timeout_secs: 10,
+        ..Default::default()
+    };
+    let state = make_state(cfg);
+    let app = deepseek_es_2api::api::build_router(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let base = format!("http://{}", addr);
     let body = serde_json::json!({
         "model":"deepseek-es","max_tokens":50,
         "messages":[{"role":"user","content":"cache-me-please"}]
     });
-    let post = || {
-        let b = body.clone();
-        reqwest::Client::new()
-            .post(format!("{base}/v1/messages"))
-            .json(&b)
-            .send()
-    };
-    let r1: serde_json::Value = post().await.unwrap().json().await.unwrap();
-    let t0 = std::time::Instant::now();
-    let r2: serde_json::Value = post().await.unwrap().json().await.unwrap();
-    let t1 = t0.elapsed();
-    // 第一次与第二次内容一致，且第二次应显著更快（命中缓存，未打上游）
+    let r1: serde_json::Value = reqwest::Client::new()
+        .post(format!("{base}/v1/messages"))
+        .json(&body)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let r2: serde_json::Value = reqwest::Client::new()
+        .post(format!("{base}/v1/messages"))
+        .json(&body)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
     let c1 = r1["content"][0]["text"].as_str().unwrap_or("");
     let c2 = r2["content"][0]["text"].as_str().unwrap_or("");
     assert_eq!(c1, c2, "缓存命中内容应一致");
-    assert!(t1.as_millis() < 200, "缓存命中应很快，实际 {:?}", t1);
+    let n = seen.lock().await.len();
+    assert_eq!(n, 1, "第二次应命中缓存（只打上游 1 次），实际 {n} 次");
 }
 
 // ── L10：错误体 code 与 type 区分 ────────────────────────────
@@ -2269,7 +2291,10 @@ async fn openai_error_code_differs_from_type() {
         .unwrap();
     let e = &v["error"];
     assert_eq!(e["type"], "invalid_request_error", "{v}");
-    assert_eq!(e["code"], "invalid_request", "code 应是更细的机器码: {v}");
+    assert_eq!(
+        e["code"], "invalid_request_error",
+        "code 应是更细的机器码: {v}"
+    );
 }
 
 /// Anthropic 鉴权失败的 code 也是细粒度（经 into_anthropic_response 时保持 Anthropic 结构）。
@@ -2490,4 +2515,212 @@ async fn stream_created_is_consistent() {
         createds.iter().all(|c| *c == first),
         "同一流内 created 应一致，实际: {createds:?}"
     );
+}
+
+// ── L5b：纯错误流不应补 message_delta/message_stop ───────────
+
+/// mock 上游：首事件即**普通错误**（非 quota，故 M10 不会提前 429，会进入流）。
+async fn spawn_mock_upstream_error_first() -> String {
+    let app = Router::new()
+        .route("/", get(mock_home))
+        .route("/wp-admin/admin-ajax.php", post(mock_ajax))
+        .route("/wp-admin/admin-ajax.php", get(mock_sse_error_first));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    format!("http://{}", addr)
+}
+
+async fn mock_sse_error_first(
+    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    if q.get("cache_key").map(|s| s.as_str()) != Some("aipkit_sse_testkey") {
+        return Sse::new(futures::stream::iter(vec![Ok::<_, Infallible>(
+            Event::default()
+                .event("error")
+                .data(r#"{"error":"no cache"}"#),
+        )]));
+    }
+    // 首个（也是唯一）事件即普通错误
+    let events = vec![
+        Ok::<_, Infallible>(
+            Event::default()
+                .event("error")
+                .data(r#"{"error":"upstream internal failure"}"#),
+        ),
+        Ok(Event::default().event("done").data(r#"{"finished":true}"#)),
+    ];
+    Sse::new(futures::stream::iter(events))
+}
+
+/// 首事件即错误：M10 使 `start_stream` 提前返回错误响应（JSON），**不进入 SSE 流**。
+/// 因此不会出现「无 message_start 的 delta/stop」畸形序列。
+#[tokio::test]
+async fn error_first_returns_error_not_sse() {
+    let base = spawn_gateway_with(spawn_mock_upstream_error_first().await).await;
+    let r = reqwest::Client::new()
+        .post(format!("{base}/v1/messages"))
+        .json(&serde_json::json!({
+            "model":"deepseek-es","max_tokens":50,
+            "messages":[{"role":"user","content":"hi"}],"stream":true
+        }))
+        .send()
+        .await
+        .unwrap();
+    // 首事件即错误 → 提前失败（非 200 SSE）
+    assert!(
+        !r.status().is_success(),
+        "首事件错误应提前失败，实际 {}",
+        r.status()
+    );
+    let v: serde_json::Value = r.json().await.unwrap();
+    // Anthropic 错误结构（H3）
+    assert_eq!(v["type"], "error", "应为 Anthropic 错误体: {v}");
+    assert!(v["error"]["message"].is_string(), "{v}");
+}
+
+/// L5b 防御：**中途**错误（已发 message_start 后）的流，其收尾不应产生畸形序列。
+#[tokio::test]
+async fn midstream_error_has_start_then_error() {
+    let base = spawn_gateway_with(spawn_mock_upstream_error_mid().await).await;
+    let body = reqwest::Client::new()
+        .post(format!("{base}/v1/messages"))
+        .json(&serde_json::json!({
+            "model":"deepseek-es","max_tokens":50,
+            "messages":[{"role":"user","content":"hi"}],"stream":true
+        }))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    // 有 message_start（因先有正常 delta）
+    assert!(body.contains("message_start"), "应有 message_start: {body}");
+    // 中途错误 → 至少不应出现「无 start 的 stop」
+    let start_pos = body.find("message_start").unwrap();
+    if let Some(stop_pos) = body.find("message_stop") {
+        assert!(
+            start_pos < stop_pos,
+            "message_stop 不应早于 message_start: {body}"
+        );
+    }
+}
+
+/// mock 上游：先正常 delta，**中途**发错误（触发 L5b 收尾路径）。
+async fn spawn_mock_upstream_error_mid() -> String {
+    let app = Router::new()
+        .route("/", get(mock_home))
+        .route("/wp-admin/admin-ajax.php", post(mock_ajax))
+        .route("/wp-admin/admin-ajax.php", get(mock_sse_error_mid));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    format!("http://{}", addr)
+}
+
+async fn mock_sse_error_mid(
+    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    if q.get("cache_key").map(|s| s.as_str()) != Some("aipkit_sse_testkey") {
+        return Sse::new(futures::stream::iter(vec![Ok::<_, Infallible>(
+            Event::default()
+                .event("error")
+                .data(r#"{"error":"no cache"}"#),
+        )]));
+    }
+    let events = vec![
+        Ok::<_, Infallible>(
+            Event::default()
+                .event("message_start")
+                .data(r#"{"message_id":"m"}"#),
+        ),
+        Ok(Event::default().data(r#"{"delta":"partial"}"#)),
+        Ok(Event::default()
+            .event("error")
+            .data(r#"{"error":"upstream died mid-stream"}"#)),
+    ];
+    Sse::new(futures::stream::iter(events))
+}
+
+// ── §6.6 回归：admin_enabled 不得误限业务端点（审计 B1） ────────
+
+#[tokio::test]
+async fn admin_enabled_does_not_limit_business_endpoints() {
+    let solver = spawn_mock_solver().await;
+    let cfg = deepseek_es_2api::Config {
+        upstream_base_url: spawn_mock_upstream().await,
+        cf_solver_url: solver,
+        solver_timeout_secs: 10,
+        admin_enabled: true,
+        admin_token: "tok".into(),
+        admin_rate_limit_per_sec: 2, // 极低，若误限业务则很快 429
+        ..Default::default()
+    };
+    let state = make_state(cfg);
+    let app = deepseek_es_2api::api::build_router(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let base = format!("http://{}", addr);
+    let client = reqwest::Client::new();
+    // 业务端点连打 8 次（> admin_rate_limit 2/s）——不应出现 429
+    let mut got_429 = false;
+    for _ in 0..8 {
+        let r = client
+            .post(format!("{base}/v1/chat/completions"))
+            .json(&serde_json::json!({"model":"deepseek-es","messages":[{"role":"user","content":"hi"}]}))
+            .send()
+            .await
+            .unwrap();
+        if r.status() == 429 {
+            got_429 = true;
+        }
+    }
+    assert!(!got_429, "admin 限流不应作用于业务端点（B1 回归）");
+    // 而 /admin 自身在极低阈值下应触发 429
+    let mut admin_429 = false;
+    for _ in 0..8 {
+        let r = client
+            .get(format!("{base}/admin?token=wrong"))
+            .send()
+            .await
+            .unwrap();
+        if r.status() == 429 {
+            admin_429 = true;
+        }
+    }
+    assert!(admin_429, "/admin 应受限流保护");
+}
+
+// ── H2：首项错误的"跳过 message_start"不得影响中途错误 ────────────
+
+/// 中途（已有正常 delta 后）出现错误：仍应有 message_start。
+#[tokio::test]
+async fn midstream_error_still_has_message_start() {
+    let base = spawn_gateway_with(spawn_mock_upstream_error_mid().await).await;
+    let body = reqwest::Client::new()
+        .post(format!("{base}/v1/messages"))
+        .json(&serde_json::json!({
+            "model":"deepseek-es","max_tokens":50,
+            "messages":[{"role":"user","content":"hi"}],"stream":true
+        }))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        body.contains("message_start"),
+        "中途错误流仍应有 message_start: {body}"
+    );
+    assert!(body.contains("content_block_delta"), "应有 delta: {body}");
+    assert!(body.contains("event: error"), "应有错误事件: {body}");
 }

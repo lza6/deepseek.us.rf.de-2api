@@ -2,6 +2,49 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/) 与 [语义化版本](https://semver.org/)。
 
+## [0.16.0] - 2026-10-08
+
+**独立审计（v0.9.0→HEAD 增量）发现的 6 项真实缺陷修复**。审计代理这次范围收窄后按时返回。
+
+### Fixed
+- **CRITICAL · Anthropic 非流式请求触发两次上游生成**：`anthropic_messages_inner` 在 `if stream` **之前**
+  就调用了一次 `start_stream`（浪费**一次性** `cache_key` + 上游配额），非流式分支又调用一次。
+  OpenAI 侧无此问题（调用在 `if stream` 内）。
+  实测证据：单次非流式 Anthropic 请求使上游 `cache_message` 被调用 **2 次**。
+  修复：把 `start_stream` 移入 `if stream` 分支。
+  测试：`anthropic_nonstream_cache_hit`（改为**上游调用计数**判定，正是它暴露了该 bug）。
+- **HIGH · `/admin` 限流误伤全部业务端点**：`router.layer(...)` 作用于**所有**已注册路由，
+  导致 `admin_enabled=true` 时 `/v1/*`、`/healthz` 全部被限到 `admin_rate_limit_per_sec`（默认 10/s）。
+  修复：拆出 `admin_routes` 子 router，**仅**对它加限流层。
+  测试：`admin_enabled_does_not_limit_business_endpoints`（业务 8 次无 429；`/admin` 8 次有 429）。
+- **HIGH · Anthropic 首项错误判定应限于"首项"**：`is_err_item` 原判定「当前项」，
+  一个**中途**错误会永久抑制 `message_start`，使其后的 `content_block_*` 挂在无 start 的流上
+  （SDK 判定协议错误）。修复：限定为**首项**（`is_first_item`）。
+  测试：`midstream_error_still_has_message_start`。
+- **MEDIUM · L6 修复不完整**：工具模式的 tail 冲刷与 usage 帧仍用 `now_secs()`，未共享流级 `created`。
+  修复：改用 `content_chunk_at` / `usage_chunk_at`。至此**全流** chunk 的 `created` 一致。
+- **MEDIUM · `Ledger::prune` 的 checkpoint 阻塞且吞错**：`wal_checkpoint(TRUNCATE)` 会长时间持锁
+  （阻塞 `record` 与控制台 `stats`），且 `let _ =` 静默吞掉失败。
+  修复：改 `PRAGMA wal_checkpoint(PASSIVE)` + 失败时 `warn!`。
+- **LOW · `to_anthropic_msg_id` 用 `trim_start_matches`**（重复剥离语义，对 `chatcmpl-chatcmpl-x` 会误剥）。
+  修复：`strip_prefix`。
+
+### Changed（兼容性）
+- `AppError::error_code()`：`BadRequest` 的 code 改回 `invalid_request_error`（与 OpenAI 一致）；
+  `QuotaExhausted` 改 `rate_limit_exceeded`。
+
+### Docs（审计发现的过期项）
+- `README.md`：测试数 186 → **202**；缓存特性补「`temperature > 0` 不缓存」。
+- `docs/DEPLOY.md`：健康检查示例版本改为 `<当前版本>`（避免再次过期）。
+
+### Verified
+- `cargo test --all`：**138 单测 + 64 集成全绿**（较 v0.15.0 新增 4 集成）；fmt / clippy 干净。
+- **真实 E2E（最终二进制）**：`e2e-v1` **8/8** 通过。
+- **压测**：8 并发 × 24 = **100%**，p50=3155ms。
+  （首次预热失败经确认为 cf_solver 间歇失败的外部因素，重试即通。）
+
+---
+
 ## [0.15.0] - 2026-10-08
 
 **L6 收尾**：同一 SSE 流内所有 chunk 共享同一 `created` 时间戳。

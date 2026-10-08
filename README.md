@@ -103,7 +103,7 @@ claude
 
 | 特性 | 配置 | 说明 |
 |------|------|------|
-| **请求级响应缓存** | `cache_ttl_secs` | 相同 prompt（**无会话语义**）短时复用；OpenAI 与 Anthropic **两端均生效** |
+| **请求级响应缓存** | `cache_ttl_secs` | 相同 prompt（**无会话语义**）短时复用；OpenAI 与 Anthropic **两端均生效**；`temperature > 0` 不缓存 |
 | **用量账本** | `ledger_path` | SQLite 持久化（`usage.db`）；空 = 关闭 |
 | **多 solver 负载均衡** | `solver_urls` | 轮询 + 健康探测 + 故障转移；空则用 `cf_solver_url` |
 | **语言注入** | `system_prompt_suffix` | 追加 system 指令（如"用用户语言回答"） |
@@ -201,7 +201,7 @@ claude
 ## 开发与测试
 
 ```bash
-# 单元测试 + 集成测试（mock 上游，186 项）
+# 单元测试 + 集成测试（mock 上游，202 项）
 cargo test
 
 # 格式与静态检查
@@ -218,7 +218,7 @@ node scripts/loadtest.mjs 4 12
 **实测结果**（真实上游）：
 | 指标 | 值 |
 |------|-----|
-| 单测 + 集成 | 186/186 通过 |
+| 单测 + 集成 | 202/202 通过 |
 | E2E OpenAI 流式 | ✅ 真实回复 |
 | E2E Anthropic 流式 | ✅ 事件序列完整 |
 | 压测 8 并发 × 24 请求 | 100% 成功，p50=1.86s，QPS 3.62 |

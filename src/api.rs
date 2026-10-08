@@ -67,28 +67,36 @@ pub fn build_router(state: SharedState) -> Router {
         ));
     }
 
+    // §6.6：`/admin` 独立限流——防本地/内网暴力破解 `admin_token`。
+    //
+    // **只作用于 `/admin*` 两个路由**（独立子 router），**不**覆盖业务端点——
+    // 此前误挂在顶层 router 上，会导致 `admin_enabled=true` 时全部 API 被限到
+    // `admin_rate_limit_per_sec`（默认 10/s），属严重误伤。
+    let admin_routes = {
+        let r = Router::new()
+            .route("/admin", get(crate::admin::admin_page))
+            .route("/admin/api/status", get(crate::admin::admin_status));
+        if state.cfg.admin_enabled {
+            let admin_rl = RateLimiter::new(state.cfg.admin_rate_limit_per_sec.max(1));
+            r.layer(axum::middleware::from_fn_with_state(
+                admin_rl,
+                admin_rate_limit_mw,
+            ))
+        } else {
+            r
+        }
+    };
+
     let mut router = Router::new()
         .route("/healthz", get(healthz))
-        // 控制台（自校验 admin_enabled/admin_token）
-        .route("/admin", get(crate::admin::admin_page))
-        .route("/admin/api/status", get(crate::admin::admin_status))
+        .merge(admin_routes)
         .merge(api)
         // 请求体上限：axum 默认 2MB 对长上下文客户端（Claude Code 的 history + tools schema）
-        // 偏小，且超限时返回**纯文本 413**（SDK 无法解析）。改为可配置，且在边界内返回协议错误。
+        // 偏小。超限的响应形状见 handlers 的显式字节校验（返回协议错误）。
         .layer(axum::extract::DefaultBodyLimit::max(
             state.cfg.max_request_bytes,
         ))
         .with_state(state.clone());
-
-    // §6.6：`/admin` 独立限流——防本地/内网暴力破解 `admin_token`。
-    // 与业务限流分离（业务限流不覆盖 /admin，此处单独加一层更严格的）。
-    if state.cfg.admin_enabled {
-        let admin_rl = RateLimiter::new(state.cfg.admin_rate_limit_per_sec.max(1));
-        router = router.layer(axum::middleware::from_fn_with_state(
-            admin_rl,
-            admin_rate_limit_mw,
-        ));
-    }
 
     if !state.cfg.cors_allow_origins.is_empty() {
         use tower_http::cors::{Any, CorsLayer};
@@ -156,12 +164,20 @@ async fn rate_limit_mw(State(rl): State<RateLimiter>, req: Request, next: Next) 
 }
 
 /// §6.6：`/admin` 专用限流中间件（防 token 暴力破解）。
+///
+/// 返回 JSON（与其它端点一致），附 `Retry-After: 1`。
 async fn admin_rate_limit_mw(State(rl): State<RateLimiter>, req: Request, next: Next) -> Response {
     if !rl.allow() {
         return (
             StatusCode::TOO_MANY_REQUESTS,
-            [(axum::http::header::CONTENT_TYPE, "text/plain")],
-            "控制台限流：请求过于频繁",
+            [(axum::http::header::RETRY_AFTER, "1")],
+            Json(serde_json::json!({
+                "error": {
+                    "message": "控制台限流：请求过于频繁",
+                    "type": "rate_limit_error",
+                    "code": "rate_limit_exceeded",
+                }
+            })),
         )
             .into_response();
     }
@@ -380,8 +396,8 @@ async fn openai_chat_inner(
                             // 取出暂扣文本 + 解析出的工具调用
                             let (tail, calls) = filter.push_finish();
                             if !tail.is_empty() {
-                                let data = serde_json::to_string(&oai::content_chunk(
-                                    &id, &model, &tail,
+                                let data = serde_json::to_string(&oai::content_chunk_at(
+                                    &id, &model, &tail, created,
                                 ))
                                 .unwrap();
                                 push_data(data);
@@ -471,7 +487,7 @@ async fn openai_chat_inner(
                     } else {
                         let pt = prompt_tokens;
                         let ct = (acc.load(std::sync::atomic::Ordering::Relaxed) / 2).max(1) as u32;
-                        let data = serde_json::to_string(&oai::usage_chunk(
+                        let data = serde_json::to_string(&oai::usage_chunk_at(
                             &id,
                             &model,
                             oai::Usage {
@@ -479,6 +495,7 @@ async fn openai_chat_inner(
                                 completion_tokens: ct,
                                 total_tokens: pt + ct,
                             },
+                            created,
                         ))
                         .unwrap();
                         vec![Ok::<_, Infallible>(Event::default().data(data))]
@@ -635,7 +652,12 @@ fn now_secs() -> i64 {
 ///
 /// 部分 Anthropic 客户端据 `msg_` 前缀判别消息类型；不改则可能被误判。
 fn to_anthropic_msg_id(chatcmpl_id: &str) -> String {
-    format!("msg_{}", chatcmpl_id.trim_start_matches("chatcmpl-"))
+    // 用 strip_prefix（剥一次）而非 trim_start_matches（重复剥离）——
+    // 后者对 `chatcmpl-chatcmpl-abc` 会静默变成 `msg_abc`。
+    format!(
+        "msg_{}",
+        chatcmpl_id.strip_prefix("chatcmpl-").unwrap_or(chatcmpl_id)
+    )
 }
 
 fn chat_completion(model: &str, content: String, prompt: &str) -> oai::ChatCompletion {
@@ -928,14 +950,17 @@ async fn anthropic_messages_inner(
     }
 
     state.upstream.ensure_authed().await?;
-    let (events, id) = start_stream(&state, &prompt, &conv_uuid, &model_id, &meta).await?;
 
     if stream {
+        // 流式：此处启动一次上游流。
+        let (events, id) = start_stream(&state, &prompt, &conv_uuid, &model_id, &meta).await?;
         let model = model_id.clone();
         // L4：Anthropic 惯例用 `msg_` 前缀（部分客户端据此判别消息类型）
         let msg_id = to_anthropic_msg_id(&id);
         let mut state_started = false;
         let mut block_started = false;
+        // H2：是否已处理过任何一项（用于「仅首项错误才跳过 message_start」判定）。
+        let mut seen_any = false;
         // M4：流式 usage 真实化（此前 message_start/message_delta 恒 0/0）
         let prompt_tokens = estimate_tokens(&prompt);
         // H3/M4：用 Arc 在 flat_map 与末尾 once 间共享输出累计与结束标记
@@ -946,6 +971,10 @@ async fn anthropic_messages_inner(
         // M7：跟踪是否已开过内容块（异常结束时据此决定是否补 content_block_stop）
         let block_open = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let block_open_c = block_open.clone();
+        // L5b：记录是否**真正发出过** message_start。若整条流只有错误（无 message_start），
+        // M7 收尾链不应补 message_delta/message_stop（否则序列畸形：error → delta → stop 无 start）。
+        let started_emitted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let started_c = started_emitted.clone();
         let prompt_tokens_c = prompt_tokens;
         // v2.0.0：工具模式下的流式 hold-back 过滤器（Anthropic 侧）
         let anth_tool_mode = !tool_defs.is_empty();
@@ -954,18 +983,26 @@ async fn anthropic_messages_inner(
             let model = model.clone();
             let msg_id = msg_id.clone();
             let mut evs: Vec<Result<Event, Infallible>> = Vec::new();
-            // L5：若**首事件即为错误**（Error/Quota/TsRequired），不应先发 message_start
-            // —— 否则客户端收到一个「已开始的正常消息」紧接错误帧，语义矛盾。
-            let is_err_item = matches!(
-                &item,
-                Ok(oai::Translated::Error(_))
-                    | Ok(oai::Translated::Quota(_))
-                    | Ok(oai::Translated::TsRequired)
-                    | Err(_)
-            );
+            // L5：**仅当首个事件**即为错误（Error/Quota/TsRequired/流错误）时跳过 message_start
+            // —— 否则客户端收到「已开始的正常消息」紧接错误帧，语义矛盾。
+            //
+            // H2 修复：判定必须限定在**首项**。此前对任意位置的错误都跳过，
+            // 会让「中途先错误、后正常 delta」的流永久缺少 message_start（其后的
+            // content_block_* 挂在无 start 的流上 → SDK 判定协议错误）。
+            let is_first_item = !seen_any;
+            seen_any = true;
+            let is_err_item = is_first_item
+                && matches!(
+                    &item,
+                    Ok(oai::Translated::Error(_))
+                        | Ok(oai::Translated::Quota(_))
+                        | Ok(oai::Translated::TsRequired)
+                        | Err(_)
+                );
             // 首帧 message_start + content_block_start
             if !state_started && !is_err_item {
                 state_started = true;
+                started_c.store(true, std::sync::atomic::Ordering::Relaxed);
                 let ms = anth::MessageStartEvent {
                     kind: anth::SSE_EVENT_MESSAGE_START,
                     message: anth::MessageBody {
@@ -1147,8 +1184,13 @@ async fn anthropic_messages_inner(
                 let finished = finished.clone();
                 let block_open = block_open.clone();
                 let out_chars = out_chars.clone();
+                let started_emitted = started_emitted.clone();
                 async move {
-                    if finished.load(std::sync::atomic::Ordering::Relaxed) {
+                    // 只有「已发过 message_start」的流才需补结束序列；
+                    // 纯错误流（error-only）已由错误帧终止，不应再补 delta/stop。
+                    if finished.load(std::sync::atomic::Ordering::Relaxed)
+                        || !started_emitted.load(std::sync::atomic::Ordering::Relaxed)
+                    {
                         Vec::new()
                     } else {
                         let mut evs: Vec<Result<Event, Infallible>> = Vec::new();

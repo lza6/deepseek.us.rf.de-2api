@@ -109,8 +109,11 @@ impl Ledger {
             let n = c
                 .execute("DELETE FROM usage WHERE ts < ?1", rusqlite::params![cutoff])
                 .map_err(|e| AppError::Internal(format!("账本清理失败: {e}")))?;
-            // 清理后折叠 WAL，回收磁盘
-            let _ = c.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);");
+            // 用 PASSIVE checkpoint（不阻塞其他读者），并在失败时**显式记录**
+            // ——此前是 `let _ =` 静默吞错，且 TRUNCATE 会长时间阻塞 record/stats。
+            if let Err(e) = c.execute_batch("PRAGMA wal_checkpoint(PASSIVE);") {
+                tracing::warn!("账本 WAL checkpoint 失败（不影响清理）: {e}");
+            }
             Ok(n)
         })
         .await

@@ -78,7 +78,7 @@ export API_KEYS="sk-your-strong-key-1,sk-your-strong-key-2"
 
 ```bash
 curl http://127.0.0.1:47833/healthz
-# {"status":"ok","upstream":"https://deepseek.es","bot_id":"27623","cf_solver":"...","version":"0.9.0"}
+# {"status":"ok","upstream":"https://deepseek.es","bot_id":"27623","cf_solver":"...","version":"<当前版本>"}
 ```
 
 日志（`RUST_LOG=info`）关键事件：
