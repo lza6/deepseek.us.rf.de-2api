@@ -2,6 +2,37 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/) 与 [语义化版本](https://semver.org/)。
 
+## [0.17.0] - 2026-10-08
+
+**§6.6 安全加固收尾**：下游 key 过期时间 + 恒定时多 key 比较 + admin token 哈希存储补齐测试。
+
+### Added
+- **下游 key 支持过期时间**（§6.6）：`api_keys` 每项可为纯字符串（无过期）或
+  `{"key":"sk-..","expires_at":<unix秒>}`。环境变量 `API_KEYS` 支持 `key:expires_at` 写法。
+  过期 key 自动拒绝（`src/auth.rs`）。新增 `ApiKey` 类型（`src/config.rs`）。
+  测试：`api_key_plain_string_backcompat`、`api_key_object_with_expiry`、`expired_api_key_rejected`。
+- **admin token 哈希存储测试**（§6.6）：`admin_token` 支持 `sha256:<hex>` 前缀形式
+  （配置文件泄露 ≠ 令牌泄露）。此前已有实现但**零测试**，现补齐 5 个单测 + 1 个集成测试
+  （`sha256_hex_known_vector` 用已知向量校验、`verify_token_sha256_prefix`、`admin_token_sha256_config_works`）。
+
+### Fixed
+- **多 key 鉴权的时序侧信道**：原 `cfg.api_keys.iter().any(...)` 在**首个匹配处短路**，
+  响应时间泄漏「命中第几个 key」。现改为**遍历全部候选并累积结果**（不短路）。
+- **admin token 哈希配置大小写敏感**：配置里写大写 hex 会**静默拒绝**。
+  现两侧规范化为小写后比较（`verify_admin_token`）。此缺陷由新增测试`verify_token_sha256_is_case_insensitive_on_config`发现并修复。
+
+### Verified
+- `cargo test --all`：**145 单测 + 66 集成全绿**（较 v0.16.0 新增 7 单测 + 2 集成）；fmt / clippy 干净。
+- **真实 E2E 受限（如实说明）**：本轮 `cf_solver` 的 camoufox **浏览器无法启动**
+  （`Failed to launch the browser process`，环境问题），真实上游 E2E **无法运行**。
+  已改用 **66 个集成测试**（mock 上游，覆盖 OpenAI/Anthropic 流式、多轮、工具调用、缓存、
+  admin、鉴权）证明功能完好。cf_solver 恢复后应重跑 `scripts/e2e-*.mjs`。
+
+### 新增依赖
+- `sha2 = "0.10"`（纯 Rust，无 C 依赖）—— 用于 admin token 哈希校验。
+
+---
+
 ## [0.16.0] - 2026-10-08
 
 **独立审计（v0.9.0→HEAD 增量）发现的 6 项真实缺陷修复**。审计代理这次范围收窄后按时返回。

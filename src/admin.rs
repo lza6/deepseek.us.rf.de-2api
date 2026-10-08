@@ -40,11 +40,44 @@ fn check_admin(
         .map(|s| s.to_string())
         .or_else(|| query_token.map(|s| s.to_string()));
     match provided {
-        Some(t) if constant_eq(&t, &state.cfg.admin_token) => Ok(()),
+        Some(t) if verify_admin_token(&state.cfg.admin_token, &t) => Ok(()),
         _ => Err(Box::new(
             (StatusCode::UNAUTHORIZED, "控制台令牌无效").into_response(),
         )),
     }
+}
+
+/// §6.6：校验控制台令牌。
+///
+/// 配置支持两种形式：
+/// - 明文（向后兼容）
+/// - `sha256:<hex>`（推荐的哈希存储：配置文件泄露 ≠ 令牌泄露）
+///
+/// 比较恒为**常量时间**。
+fn verify_admin_token(configured: &str, provided: &str) -> bool {
+    if let Some(hex) = configured.strip_prefix("sha256:") {
+        let digest = sha256_hex(provided.as_bytes());
+        // 两侧都规范化为小写后常量时间比较——运维常写大写 hex，
+        // 直接比较会静默拒绝，属健壮性问题。
+        let want = hex.trim().to_ascii_lowercase();
+        constant_eq(&digest, &want)
+    } else {
+        constant_eq(provided, configured)
+    }
+}
+
+/// SHA-256 → 小写 hex。
+pub fn sha256_hex(data: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(data);
+    let out = h.finalize();
+    let mut s = String::with_capacity(out.len() * 2);
+    for b in out {
+        use std::fmt::Write;
+        let _ = write!(s, "{b:02x}");
+    }
+    s
 }
 
 fn constant_eq(a: &str, b: &str) -> bool {
@@ -238,5 +271,49 @@ mod tests {
         assert!(!ADMIN_HTML.contains("<link rel=\"stylesheet\""));
         assert!(ADMIN_HTML.contains("admin/api/status"));
         assert!(ADMIN_HTML.contains("--bg:#0d1117"), "应有明确设计令牌");
+    }
+
+    // ── §6.6：admin_token 哈希存储校验 ──────────────────────
+
+    #[test]
+    fn sha256_hex_known_vector() {
+        // 空串的 SHA-256（已知向量）
+        assert_eq!(
+            sha256_hex(b""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        // "abc" 的 SHA-256（已知向量）
+        assert_eq!(
+            sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    #[test]
+    fn verify_token_plaintext_backcompat() {
+        // 明文配置（向后兼容）
+        assert!(verify_admin_token("s3cret", "s3cret"));
+        assert!(!verify_admin_token("s3cret", "wrong"));
+    }
+
+    #[test]
+    fn verify_token_sha256_prefix() {
+        let hex = sha256_hex(b"s3cret");
+        let configured = format!("sha256:{hex}");
+        assert!(verify_admin_token(&configured, "s3cret"));
+        assert!(!verify_admin_token(&configured, "wrong"));
+        // 明文假配置（前缀但值不是正确哈希）必须拒绝
+        assert!(!verify_admin_token("sha256:deadbeef", "s3cret"));
+    }
+
+    #[test]
+    fn verify_token_sha256_is_case_insensitive_on_config() {
+        // 配置里的 hex 允许大写（trim 后比较）；注意 hash 输出恒小写
+        let hex = sha256_hex(b"tok").to_ascii_uppercase();
+        let configured = format!("sha256:  {hex}  "); // 含多余空格
+        assert!(
+            verify_admin_token(&configured, "tok"),
+            "配置侧 hex 大小写/空白应被容忍"
+        );
     }
 }

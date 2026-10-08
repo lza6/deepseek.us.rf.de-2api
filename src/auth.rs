@@ -7,16 +7,34 @@ use axum::http::HeaderMap;
 /// 校验下游请求。返回 Ok(()) 表示放行。
 ///
 /// 规则：
-/// - 配置了 api_keys：必须匹配其中一个（Authorization: Bearer <k> 或 x-api-key: <k>）
-/// - 未配置 api_keys：仅允许本机（由中间件/监听地址保证），此处恒放行
+/// - 配置了 `api_keys`：必须匹配其中一个（`Authorization: Bearer <k>` 或 `x-api-key: <k>`）；
+///   支持过期时间（见 `ApiKey`）。
+/// - 未配置 `api_keys`：仅允许本机（由启动时 `validate_security` + 监听地址保证），此处恒放行。
+///
+/// **常量时间**：对所有候选 key 逐一比较并**累积**结果（不短路），
+/// 避免通过响应时间泄漏「匹配到了第几个 key」或「前缀是否命中」。
 pub fn check_auth(cfg: &Config, headers: &HeaderMap) -> AppResult<()> {
     if cfg.api_keys.is_empty() {
         return Ok(());
     }
-    let provided = extract_key(headers);
-    match provided {
-        Some(k) if cfg.api_keys.iter().any(|allowed| constant_eq(allowed, &k)) => Ok(()),
-        _ => Err(AppError::Unauthorized),
+    let Some(provided) = extract_key(headers) else {
+        return Err(AppError::Unauthorized);
+    };
+    let now = chrono::Utc::now().timestamp();
+    let mut matched = false;
+    for entry in cfg.api_keys.iter() {
+        // 过期 key 直接跳过（先判过期再比较，避免对已失效 key 做无谓比较；
+        // 过期与否不是秘密，不构成时序泄漏面）。
+        if entry.is_expired(now) {
+            continue;
+        }
+        // 不短路：即使已匹配也继续比较其余 key（保持总比较次数与配置项数相关而与命中位置无关）。
+        matched |= constant_eq(entry.secret(), &provided);
+    }
+    if matched {
+        Ok(())
+    } else {
+        Err(AppError::Unauthorized)
     }
 }
 
@@ -62,7 +80,10 @@ mod tests {
 
     fn cfg_with_keys(keys: &[&str]) -> Config {
         Config {
-            api_keys: keys.iter().map(|s| s.to_string()).collect(),
+            api_keys: keys
+                .iter()
+                .map(|s| crate::config::ApiKey::plain(*s))
+                .collect(),
             ..Default::default()
         }
     }

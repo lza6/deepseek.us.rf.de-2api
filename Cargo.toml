@@ -1,6 +1,6 @@
 [package]
 name = "deepseek-es-2api"
-version = "0.16.0"
+version = "0.17.0"
 edition = "2021"
 description = "deepseek.es 免费 AI 服务 → OpenAI/Anthropic 兼容 API 网关（Rust 版，Cloudflare Turnstile 求解）"
 authors = ["lza6"]
@@ -26,6 +26,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
 thiserror = "2"
+sha2 = "0.10"
 bytes = "1"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 

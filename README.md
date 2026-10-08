@@ -150,7 +150,7 @@ claude
 | `bot_id` | `27623` | AIPKit 机器人 ID |
 | `sitekey` | `0x4AAAAAADlLZ3ljqZP6cQwq` | Turnstile sitekey |
 | `cf_solver_url` | `http://127.0.0.1:8001` | 求解器地址 |
-| `api_keys` | `[]` | 下游 Key；空 = 仅本机放行 |
+| `api_keys` | `[]` | 下游 Key；空 = 仅本机放行。支持 `"sk-x"` 或 `{"key":"sk-x","expires_at":<unix秒>}`（过期自动拒绝） |
 | `proxy` | `null` | 上游出口代理（如 `http://127.0.0.1:10808`） |
 | `user_agent` | `Chrome/150` | 浏览器 UA（**必须与 cf_solver 一致**，否则 cookie 绑定失败） |
 | `default_model` | `deepseek-es` | 默认模型 id（可自定义，`resolve_model` 据此回退） |
@@ -165,7 +165,7 @@ claude
 | `max_concurrency` | `0` | **全局**最大并发（0 = 不限）。注：仅在 handler 返回响应头前生效，不约束已建立的 SSE 流时长 |
 | `rate_limit_per_sec` | `0` | 端点每秒限流（0 = 不限，固定窗口，全局共享；位于鉴权之前，未鉴权请求同样计数） |
 | `admin_enabled` | `false` | 启用控制台 |
-| `admin_token` | `""` | 控制台访问令牌（启用时必填） |
+| `admin_token` | `""` | 控制台令牌（启用时必填）；支持 `sha256:<hex>` 哈希形式（泄露 ≠ 令牌泄露） |
 | `admin_rate_limit_per_sec` | `10` | 控制台独立限流（防 token 暴力破解） |
 | `cache_ttl_secs` | `300` | 响应缓存 TTL（0 = 关闭） |
 | `cache_max_entries` | `1000` | 响应缓存最大条目 |
@@ -201,7 +201,7 @@ claude
 ## 开发与测试
 
 ```bash
-# 单元测试 + 集成测试（mock 上游，202 项）
+# 单元测试 + 集成测试（mock 上游，211 项）
 cargo test
 
 # 格式与静态检查
@@ -218,7 +218,7 @@ node scripts/loadtest.mjs 4 12
 **实测结果**（真实上游）：
 | 指标 | 值 |
 |------|-----|
-| 单测 + 集成 | 202/202 通过 |
+| 单测 + 集成 | 211/211 通过 |
 | E2E OpenAI 流式 | ✅ 真实回复 |
 | E2E Anthropic 流式 | ✅ 事件序列完整 |
 | 压测 8 并发 × 24 请求 | 100% 成功，p50=1.86s，QPS 3.62 |

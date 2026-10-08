@@ -89,6 +89,84 @@ fn default_max_request_bytes() -> usize {
     8 * 1024 * 1024
 }
 
+/// 下游 API Key 条目（§6.6：支持过期时间）。
+///
+/// 反序列化兼容两种形式：
+/// - 纯字符串 `"sk-xxx"` → 无过期
+/// - 对象 `{"key":"sk-xxx","expires_at":1735689600}` → 带过期（unix 秒，UTC）
+///
+/// 序列化统一为**对象**形式（便于运维看清过期时间）。
+#[derive(Debug, Clone, Serialize)]
+pub struct ApiKey {
+    key: String,
+    /// 过期时刻（unix 秒）。`None` = 永不过期。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    expires_at: Option<i64>,
+}
+
+impl ApiKey {
+    /// 平文密钥（用于常量时间比较）。
+    pub fn secret(&self) -> &str {
+        &self.key
+    }
+
+    /// 在 `now`（unix 秒）时是否已过期。
+    pub fn is_expired(&self, now: i64) -> bool {
+        self.expires_at.map(|t| now >= t).unwrap_or(false)
+    }
+
+    /// 由纯字符串构造（无过期）。
+    pub fn plain(key: impl Into<String>) -> Self {
+        ApiKey {
+            key: key.into(),
+            expires_at: None,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ApiKey {
+    fn deserialize<D>(d: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Raw {
+            Plain(String),
+            Full {
+                key: String,
+                #[serde(default)]
+                expires_at: Option<i64>,
+            },
+        }
+        match Raw::deserialize(d)? {
+            Raw::Plain(key) => Ok(ApiKey {
+                key,
+                expires_at: None,
+            }),
+            Raw::Full { key, expires_at } => Ok(ApiKey { key, expires_at }),
+        }
+    }
+}
+
+impl From<String> for ApiKey {
+    fn from(s: String) -> Self {
+        ApiKey::plain(s)
+    }
+}
+
+impl From<&str> for ApiKey {
+    fn from(s: &str) -> Self {
+        ApiKey::plain(s)
+    }
+}
+
+impl PartialEq for ApiKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.key == other.key && self.expires_at == other.expires_at
+    }
+}
+
 /// 顶层配置。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -113,9 +191,11 @@ pub struct Config {
     /// 默认模型别名
     #[serde(default = "default_model")]
     pub default_model: String,
-    /// 下游 API Key 白名单；空 = 仅本机放行（无鉴权）
+    /// 下游 API Key 白名单；空 = 仅本机放行（无鉴权）。
+    ///
+    /// 每项可为**纯字符串**（无过期）或**对象** `{"key":"sk-..","expires_at":<unix秒>}`。
     #[serde(default)]
-    pub api_keys: Vec<String>,
+    pub api_keys: Vec<ApiKey>,
     /// 出口代理（可选，如 http://127.0.0.1:10808）
     #[serde(default)]
     pub proxy: Option<String>,
@@ -303,10 +383,18 @@ impl Config {
             }
         }
         if let Ok(v) = std::env::var("API_KEYS") {
-            let keys: Vec<String> = v
+            // 支持 `key` 与 `key:expires_at`（unix 秒）两种写法，逗号分隔。
+            let keys: Vec<ApiKey> = v
                 .split(',')
-                .map(|s| s.trim().to_string())
+                .map(|s| s.trim())
                 .filter(|s| !s.is_empty())
+                .map(|s| match s.rsplit_once(':') {
+                    Some((k, ts)) if ts.chars().all(|c| c.is_ascii_digit()) => ApiKey {
+                        key: k.trim().to_string(),
+                        expires_at: ts.parse::<i64>().ok(),
+                    },
+                    _ => ApiKey::plain(s),
+                })
                 .collect();
             if !keys.is_empty() {
                 self.api_keys = keys;
@@ -464,5 +552,43 @@ mod tests {
         assert!(!host_is_loopback("192.168.1.1:1"));
         assert!(!host_is_loopback("example.com:1"));
         assert!(!host_is_loopback(""));
+    }
+
+    // ── §6.6：ApiKey 反序列化与过期 ──────────────────────────
+
+    #[test]
+    fn api_key_plain_string_backcompat() {
+        // 纯字符串形式（旧配置）必须仍可解析
+        let cfg: Config = serde_json::from_str(r#"{"api_keys":["sk-a","sk-b"]}"#).unwrap();
+        assert_eq!(cfg.api_keys.len(), 2);
+        assert_eq!(cfg.api_keys[0].secret(), "sk-a");
+        assert!(!cfg.api_keys[0].is_expired(i64::MAX), "无过期应永不过期");
+    }
+
+    #[test]
+    fn api_key_object_with_expiry() {
+        let cfg: Config = serde_json::from_str(
+            r#"{"api_keys":[{"key":"sk-x","expires_at":1000},{"key":"sk-y"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.api_keys.len(), 2);
+        assert!(!cfg.api_keys[0].is_expired(999), "未到期");
+        assert!(cfg.api_keys[0].is_expired(1000), "到点即过期");
+        assert!(cfg.api_keys[0].is_expired(1001), "已过期");
+        assert!(
+            !cfg.api_keys[1].is_expired(i64::MAX),
+            "无 expires_at 永不过期"
+        );
+    }
+
+    #[test]
+    fn api_key_env_parsing_with_expiry() {
+        // 环境变量形式 `key:expires_at`
+        let a = ApiKey::plain("sk-plain");
+        assert!(!a.is_expired(0));
+        // 直接构造对象形式
+        let b: ApiKey = serde_json::from_str(r#"{"key":"sk-ts","expires_at":50}"#).unwrap();
+        assert!(b.is_expired(50));
+        assert!(!b.is_expired(49));
     }
 }

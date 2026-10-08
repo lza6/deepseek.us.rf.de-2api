@@ -2724,3 +2724,91 @@ async fn midstream_error_still_has_message_start() {
     assert!(body.contains("content_block_delta"), "应有 delta: {body}");
     assert!(body.contains("event: error"), "应有错误事件: {body}");
 }
+
+// ── §6.6：过期 key 拒绝 + 有效 key 放行 ─────────────────────
+
+#[tokio::test]
+async fn expired_api_key_rejected() {
+    let solver = spawn_mock_solver().await;
+    let cfg = deepseek_es_2api::Config {
+        upstream_base_url: spawn_mock_upstream().await,
+        cf_solver_url: solver,
+        solver_timeout_secs: 10,
+        // 一个已过期 + 一个有效
+        api_keys: serde_json::from_str(
+            r#"[{"key":"sk-expired","expires_at":1},{"key":"sk-good"}]"#,
+        )
+        .unwrap(),
+        ..Default::default()
+    };
+    let state = make_state(cfg);
+    let app = deepseek_es_2api::api::build_router(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let base = format!("http://{}", addr);
+    let client = reqwest::Client::new();
+
+    // 过期 key → 401
+    let r = client
+        .get(format!("{base}/v1/models"))
+        .header("x-api-key", "sk-expired")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 401, "过期 key 应被拒");
+
+    // 有效 key → 200
+    let r2 = client
+        .get(format!("{base}/v1/models"))
+        .header("x-api-key", "sk-good")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r2.status(), 200, "有效 key 应放行");
+}
+
+/// §6.6：admin_token 用 sha256: 前缀配置时，正确明文可访问、错误明文被拒。
+#[tokio::test]
+async fn admin_token_sha256_config_works() {
+    let solver = spawn_mock_solver().await;
+    let cfg = deepseek_es_2api::Config {
+        upstream_base_url: spawn_mock_upstream().await,
+        cf_solver_url: solver,
+        solver_timeout_secs: 10,
+        admin_enabled: true,
+        // "secret" 的 SHA-256
+        admin_token: "sha256:2bb80d537b1da3e38bd30361aa855686bde0eacd7162fef6a25fe97bf527a25b"
+            .into(),
+        ..Default::default()
+    };
+    let state = make_state(cfg);
+    let app = deepseek_es_2api::api::build_router(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let base = format!("http://{}", addr);
+    let client = reqwest::Client::new();
+
+    // 正确明文（经哈希）→ 200
+    let r = client
+        .get(format!("{base}/admin/api/status"))
+        .header("x-admin-token", "secret")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200, "正确明文应通过哈希校验");
+
+    // 错误明文 → 401
+    let r2 = client
+        .get(format!("{base}/admin/api/status"))
+        .header("x-admin-token", "wrong")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r2.status(), 401, "错误明文应被拒");
+}
