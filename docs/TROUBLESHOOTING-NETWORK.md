@@ -117,3 +117,60 @@ postMessage 握手在此环境下不成立 —— 与"API 未初始化"互为印
 cd target/diag && PYTHONUTF8=1 <venv>/Scripts/python.exe probe13.py
 # 期望看到: {'ts': 'undefined', 'widgets': 1, 'ifr': 0, ...}
 ```
+
+---
+
+## 9. 自动获取 cookie 的可行性验证（2026-10-08 追加）
+
+用户提出"自动获取 cookie"。做了 **12 组对照实验**，结论如下。
+
+### 9.1 三条路，只有一条可行
+
+| 路线 | 做法 | 实测结果 |
+|------|------|---------|
+| ① camoufox 访问站点自动拿 cookie | 逛一圈让站点自己签发 | ❌ **不可行**。90s 内 cookie 只有 `dsgt_gid`；`window.turnstile` 始终 `undefined` |
+| ② 真实 Chrome 自动跑 | playwright + `channel="chrome"` | ⚠️ **API 可用但挑战不下发**（详见 9.3） |
+| ③ 从用户已有浏览器读 | 人工过一次 → 导出 cookie | ✅ **唯一可靠**（已实现，`scripts/collect-cookie.mjs`） |
+
+### 9.2 关键突破：camoufox vs 真实 Chrome
+
+| 指标 | camoufox | 真实 Chrome |
+|------|----------|-------------|
+| `typeof window.turnstile` | **`undefined`** | **`object`** ✅ |
+| `typeof window.deepseekTsInit` | **`undefined`** | **`function`** ✅ |
+| `turnstile.render()` 可调用 | 否 | **是**（返回 widget id） |
+| 挑战 iframe 注入 | 否 | **否** ❌ |
+| 拿到 token | 否 | **否** ❌ |
+
+**这直接证实了 §3 的根因诊断**：`window.turnstile` 未暴露**确系 camoufox 环境问题**
+（真实 Chrome 下完全正常）。但——**换到真实 Chrome 后仍拿不到 token**，说明还有第二层阻碍。
+
+### 9.3 ✅ 最终失败点（网络层，有确切证据）
+
+用真实 Chrome 抓取 CF 的全部网络请求：
+
+```
+200  .../turnstile/v0/g/4df4a60fa397/api.js                       ← API 脚本加载成功
+200  .../challenge-platform/h/g/turnstile/f/av0/rch/r87ho/.../normal ← 挑战配置 OK
+200  .../challenge-platform/h/g/fo/2029158330:.../a4742dff9aaab360   ← 指纹上报 OK
+200  .../challenge-platform/h/g/ci/a4742dff9aaab360/.../6Yjsryi...   ← 完整性校验 OK
+401  .../challenge-platform/h/g/pat/a4742dff9aaab360/1791452394646/...  ← ❌ 401
+401  .../challenge-platform/h/g/pat/a4742e557d45b360/1791452403930/...  ← ❌ 401
+```
+
+`pat` = CF 的 **PoW（工作量证明）提交端点**，返回 **401 Unauthorized**。
+
+即：CF 平台 JS 全程正常执行、指纹正常上报，但**在提交工作量证明时被 CF 边缘拒绝**。
+与 `probe9.py` 捕获的 `postMessage` origin 不匹配互为印证 —— **CF 判定该会话不可信，拒发 token**。
+
+此结论对 camoufox 与真实 Chrome **同时成立**。
+
+### 9.4 结论
+
+**自动获取 cookie 不可行**（在当前离线出口 `129.146.124.201` 下）。
+不是代码问题，是 **CF 对该出口 IP 的信任判定**。
+
+**唯一可靠路径仍是路线 ③**：用户在自己浏览器（家宽 IP + 真人操作）过一次 CF，
+用 `scripts/collect-cookie.mjs` 把 cookie 交给网关。
+
+**待验证**：换家宽/移动代理后，`pat` 端点是否返回 200（若返回 200 则路线 ② 复活）。
