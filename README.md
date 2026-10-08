@@ -105,7 +105,8 @@ claude
 |------|------|------|
 | **请求级响应缓存** | `cache_ttl_secs` | 相同 prompt（**无会话语义**）短时复用；OpenAI 与 Anthropic **两端均生效**；`temperature > 0` 不缓存 |
 | **用量账本** | `ledger_path` | SQLite 持久化（`usage.db`）；空 = 关闭 |
-| **多 solver 负载均衡** | `solver_urls` | 轮询 + 健康探测 + 故障转移；空则用 `cf_solver_url` |
+| **多 solver 负载均衡** | `solver_urls` | 轮询 + 健康探测 + 故障转移；可混用浏览器与第三方 API 后端 |
+| **第三方 API solver** | `tools/api_solver` | 纯 HTTP 适配器（capsolver/2captcha），camoufox 宕机时接管 |
 | **语言注入** | `system_prompt_suffix` | 追加 system 指令（如"用用户语言回答"） |
 | **多轮对话** | — | 客户端发送的完整消息历史会被渲染进 prompt（见下） |
 | **工具调用** | — | 协议级 `tools`/`tool_calls`（OpenAI）与 `tools`/`tool_use`（Anthropic），见下 |
@@ -172,7 +173,7 @@ claude
 | `cache_min_chars` | `0` | 低于该长度的结果不缓存 |
 | `ledger_path` | `usage.db` | SQLite 账本路径（空 = 关闭） |
 | `ledger_retention_days` | `30` | 账本保留天数（0 = 不清理）；超期记录每 6h 自动删除 |
-| `solver_urls` | `[]` | 多 cf_solver 地址（空则用 `cf_solver_url`） |
+| `solver_urls` | `[]` | 多 solver 地址（轮询 + 故障转移）。可混用 camoufox（tools/cf_solver）与第三方 API 适配器（tools/api_solver） |
 | `system_prompt_suffix` | `""` | 追加的 system 指令（语言/风格） |
 | `pseudo_tools_enabled` | `false` | 启用伪工具（注入工具说明；模型输出 ` ```tool ` 块 → 本地执行） |
 | `max_response_bytes` | `2097152` | 非流式聚合上限（防超大响应） |

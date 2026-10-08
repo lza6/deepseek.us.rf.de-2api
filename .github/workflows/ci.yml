@@ -27,6 +27,8 @@ jobs:
         run: cargo build --release
       - name: Test
         run: cargo test --all
+      - name: api_solver adapter tests
+        run: node tools/api_solver/server.test.mjs
 
   docker:
     runs-on: ubuntu-latest

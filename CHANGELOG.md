@@ -1,7 +1,40 @@
-# Changelog
-
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/) 与 [语义化版本](https://semver.org/)。
 
+## [0.18.0] - 2026-10-08
+
+**CF 求解可插拔**：新增纯 HTTP 的第三方 captcha API 适配器，解决 camoufox 单点故障。
+
+### Added
+- **`tools/api_solver/`** —— 把 **capsolver / 2captcha** 的 Turnstile API 翻译成
+  本项目网关认识的 `cf_solver` 契约（`GET /turnstile` + `GET /result`）。**纯 HTTP，无浏览器**。
+  网关**无需改动**：把它加进 `solver_urls` 即可与 camoufox 实例**并存做故障转移**。
+  - 支持 `API_SOLVER_PROVIDER`（capsolver/2captcha）、`API_SOLVER_KEY`、`API_SOLVER_PORT`（默认 8002）。
+  - 未配置 key → `/turnstile` 返回 **503**（不静默失败）。**不含任何 key 硬编码**。
+  - 测试：`node tools/api_solver/server.test.mjs` → **21/21 通过**（无需网络/key，用注入 fetch 桩）。
+  - **已接入 CI**（`ci.yml` 新增一步）。
+- `docs/TROUBLESHOOTING-NETWORK.md` —— 记录本轮 cf_solver 故障的**完整根因**与处置。
+
+### 调查结论（如实，附证据）
+**cf_solver 宕机的根因是机器网络出口中断**，非代码问题。逐层探测：
+`1.1.1.1:443`、`8.8.8.8:53`、deepseek.es 的 CF IP **全部 TCP 不可达**；
+代理 10808（HTTP 与 SOCKS5）均失败；**DNS 解析正常**。
+
+**「纯协议求解 Turnstile」不可行**（技术上不可能，非未实现）——三条证据：
+1. 上游 JS 注释：`// Turnstile rendern (Managed)`
+2. `home.html` 含 `challenges.cloudflare.com/turnstile` widget
+3. 上层项目 `cf_clearance_solver.py` 文档明确：「**不用于 Turnstile widget**」
+
+Managed Challenge 的 token 由 CF 服务端在验证 JS 执行 + 浏览器指纹后签发，
+**设计目标即不可纯协议伪造**。因此本版本提供的是**第三方真实求解 API 适配器**
+（其内部仍是求解农场），而非协议伪造。
+
+### Verified
+- `cargo test --all`：**145 单测 + 66 集成全绿**；fmt / clippy 干净。
+- `node tools/api_solver/server.test.mjs`：**21/21 通过**。
+- **真实 E2E 仍受阻**：网络出口未恢复前无法跑 `scripts/e2e-*.mjs`
+  （恢复步骤见 `docs/TROUBLESHOOTING-NETWORK.md`）。
+
+---
 ## [0.17.0] - 2026-10-08
 
 **§6.6 安全加固收尾**：下游 key 过期时间 + 恒定时多 key 比较 + admin token 哈希存储补齐测试。
