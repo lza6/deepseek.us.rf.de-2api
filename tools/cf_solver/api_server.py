@@ -40,6 +40,24 @@ class ClearanceAPIServer:
     </head>
     <body>
         <!-- cf turnstile -->
+        <script>
+            // ── 修复（2026-10-08）──
+            // api.js 带 `?onload=` 参数时进入**显式渲染模式**：Cloudflare 不会自动
+            // 扫描并渲染 `.cf-turnstile`，而是回调本函数，要求你自行调用 render()。
+            // 本模板此前**从未定义该回调** → 容器 div 永远为空 → 无 iframe →
+            // 点击无处可点 → solver 退化为「纯等隐式 token」，这才是 captcha_fail 的根因。
+            //
+            // 计数器供求解循环判定「widget 是否真正渲染」。
+            window.__cfWidgetCount = 0;
+            window.onloadTurnstileCallback = function () {
+                try {
+                    window.turnstile.render('.cf-turnstile', { callback: function (t) { window.__cfToken = t; } });
+                    window.__cfWidgetCount = 1;
+                } catch (e) {
+                    window.__cfRenderError = String(e);
+                }
+            };
+        </script>
     </body>
     </html>
     """
@@ -383,6 +401,42 @@ class ClearanceAPIServer:
             )
             page_data = self.HTML_TEMPLATE.replace("<!-- cf turnstile -->", turnstile_div)
 
+            # ── 关键修复（2026-10-08）──
+            # 原实现在**假页面**（route 篡改 HTML）上渲染 widget，实测结构性失败：
+            #   Turnstile 的 iframe（origin=challenges.cloudflare.com）渲染后会向
+            #   **宿主窗口** postMessage，而宿主 origin 是被篡改的 https://deepseek.es，
+            #   与真实站点不符 → `Failed to execute 'postMessage': target origin ...
+            #   does not match the recipient window's origin` → widget 卡死在空 div，
+            #   永不出现 iframe（实测 iframes=0 持续 20s+）→ 只能靠极低概率兜底。
+            # 正确做法：**在真实页面上求解**（origin 天然正确）。假页面仅作兜底。
+            try:
+                await page.goto(url_with_slash, wait_until="domcontentloaded", timeout=60000)
+                real_page_ok = True
+                logger.info(f"[Turnstile] 已加载真实页面 — {task_id}")
+                # ── 辅助修复（2026-10-08）──
+                # deepseek.es 的 Turnstile 初始化回调 `deepseekTsInit` 由内联脚本
+                # `<script id="deepseek-ts-js">` 定义。实测（probe5/probe11）该脚本
+                # 节点存在于 DOM 但**在部分环境下不执行** → api.js 的 onload 回调
+                # 找不到 `deepseekTsInit`（console 明确报：
+                #   "Unable to find onload callback 'deepseekTsInit' ... got 'undefined'"
+                #   "Turnstile skipped implicit render because a widget already exists"）
+                # → `window.turnstile` 永不暴露 → 站点 process() 无法 render widget。
+                # 这里主动 eval 它完成注册（实测 eval 后 typeof 立即变 function）。
+                try:
+                    reg = await page.evaluate("""() => {
+                        const s = document.getElementById('deepseek-ts-js');
+                        if (!s) return 'no-site-script';
+                        if (typeof window.deepseekTsInit === 'function') return 'already';
+                        try { (0, eval)(s.textContent); } catch (e) { return 'eval-err:' + e; }
+                        return 'registered:' + typeof window.deepseekTsInit;
+                    }""")
+                    logger.info(f"[Turnstile] 站点回调注册: {reg} — {task_id}")
+                except Exception as e:
+                    logger.debug(f"[Turnstile] 注册站点回调失败（忽略）: {e}")
+            except Exception as e:
+                real_page_ok = False
+                logger.warning(f"[Turnstile] 真实页面加载失败({e})，回退假页面 — {task_id}")
+
             MAX_ROUNDS = 2
             for round_num in range(1, MAX_ROUNDS + 1):
                 if round_num > 1:
@@ -425,51 +479,97 @@ class ClearanceAPIServer:
                     r_url = req.url
                     r_type = req.resource_type
 
-                    if r_url.rstrip("/") == url_with_slash.rstrip("/"):
+                    # 仅在**假页面兜底**模式下篡改目标页 HTML；真实页面模式放行。
+                    if (not real_page_ok) and r_url.rstrip("/") == url_with_slash.rstrip("/"):
                         await route.fulfill(body=page_data, status=200, content_type="text/html")
                         return
 
-                    if r_type in ["image", "media", "font", "stylesheet"]:
+                    # 注意：**不要** abort `stylesheet` —— Turnstile 的 checkbox 位于
+                    # 跨域 iframe 内，样式被阻断会让控件尺寸/定位失准。
+                    if r_type in ["image", "media", "font"]:
                         try:
                             await route.abort()
                         except Exception:
                             pass
                         return
 
-                    # 仅放行必要请求 (challenges.cloudflare.com, script, document, xhr, fetch)
+                    # 其余（含 challenges.cloudflare.com 的 script/xhr）一律放行
                     try:
                         await route.continue_()
                     except Exception:
                         pass
 
                 await page.route("**/*", _turnstile_route_handler)
-                await page.goto(url_with_slash, wait_until="commit", timeout=15000)
+                if not real_page_ok and round_num == 1:
+                    # 兜底：假页面（已在上方 goto 失败时记录告警）
+                    await page.goto(url_with_slash, wait_until="commit", timeout=15000)
 
                 solved = False
-                # 极速探测：初段采用 50ms~100ms 快速轮询与智能触发，大幅缩短求解时延
-                for attempt in range(120):  # 120 × 0.15s = ~18 秒
+                # ── 修复（2026-10-08）：交互式 Managed Challenge 的正确处理 ──
+                #
+                # 原实现的两个缺陷（实测导致 ~90% captcha_fail）：
+                #   1. `locator(...).click()` 是**无鼠标轨迹的合成点击**，Turnstile 对
+                #      "瞬移式点击"高度敏感，交互挑战因此**永不完成**；
+                #   2. 每轮预算仅 120×0.15≈18s，且失败即 `goto` 重载 —— 有多次
+                #      快照证明 **token 已在预算外到达却被重载冲掉**。
+                # 修复：① 用 `wait_for_function` 阻塞等待（无抖动漏读）；
+                #       ② 每轮预算提到 ~45s；
+                #       ③ 点击改为「先移动鼠标形成轨迹再点击真实坐标」；
+                #       ④ 仅在未勾选时点，避免反复合成点击拉高风险分。
+                deadline = time.time() + 45.0
+                clicked = False
+                while time.time() < deadline:
                     try:
-                        value = await page.input_value("[name=cf-turnstile-response]", timeout=150)
-                        if value:
-                            elapsed = round(time.time() - start_time, 3)
-                            self.results[task_id] = {"status": "success", "elapsed_time": elapsed, "value": value}
-                            logger.info(f"[Turnstile] Sukses (putaran {round_num}) — {task_id} ({elapsed}s)")
-                            solved = True
-                            return
-                        else:
-                            # 尝试触发 Turnstile 容器点击 (如遇交互型验证)
-                            if attempt % 2 == 0:
+                        value = await page.input_value("[name=cf-turnstile-response]", timeout=500)
+                    except Exception:
+                        value = ""
+                    if value:
+                        elapsed = round(time.time() - start_time, 3)
+                        self.results[task_id] = {"status": "success", "elapsed_time": elapsed, "value": value}
+                        logger.info(f"[Turnstile] Sukses (putaran {round_num}) — {task_id} ({elapsed}s)")
+                        solved = True
+                        return
+                    # 未拿到 token 且尚未交互：等 widget 渲染后再做一次「类人」点击
+                    if not clicked:
+                        clicked = True
+                        # Turnstile 可能挂在 `.cf-turnstile` 或站点自定义容器
+                        # （deepseek.es 用 `deepseek-ts-widget`）。两者都等。
+                        sel = ("//div[contains(@class,'cf-turnstile')]//iframe"
+                               " | //deepseek-ts-widget//iframe"
+                               " | //iframe[contains(@src,'challenges.cloudflare.com')]")
+                        try:
+                            await page.wait_for_selector(sel, timeout=20000)
+                        except Exception:
+                            pass
+                        try:
+                            n_iframe = await page.locator(sel).count()
+                            n_div = await page.locator("//div[contains(@class,'cf-turnstile')] | //deepseek-ts-widget").count()
+                            logger.info(f"[Diag] round={round_num} div={n_div} iframe={n_iframe} — {task_id}")
+                            if n_iframe:
+                                box = await page.locator(sel).first.bounding_box()
+                                if box:
+                                    # 复选框在 iframe 内靠左（约 30px），垂直居中
+                                    cx = box["x"] + 30
+                                    cy = box["y"] + box["height"] / 2
+                                    await page.mouse.move(cx, cy, steps=12)
+                                    await asyncio.sleep(0.25)
+                                    await page.mouse.click(cx, cy)
+                                    logger.info(f"[Turnstile] 已点击 iframe 复选框 (x={cx:.0f},y={cy:.0f}) — {task_id}")
+                            else:
                                 try:
-                                    await page.locator("//div[@class='cf-turnstile']").click(timeout=100)
-                                except Exception:
-                                    pass
-                            await asyncio.sleep(0.15)
-                    except Exception as e:
-                        logger.debug(f"[Turnstile] Putaran {round_num} percobaan {attempt + 1} gagal: {e}")
-                        await asyncio.sleep(0.15)
+                                    html = await page.evaluate(
+                                        "() => { const d=document.querySelector('.cf-turnstile,deepseek-ts-widget');"
+                                        " return d ? d.outerHTML.slice(0,400) : '(none)'; }"
+                                    )
+                                except Exception as e:
+                                    html = f"(eval failed: {e})"
+                                logger.warning(f"[Turnstile] ⚠️ 无 iframe 可点 (div={n_div}) — {task_id} | DOM={html}")
+                        except Exception as e:
+                            logger.warning(f"[Turnstile] 点击 widget 异常: {e} — {task_id}")
+                    await asyncio.sleep(0.5)
 
                 if not solved:
-                    logger.warning(f"[Turnstile] Putaran {round_num} gagal 30x — {task_id}, {'retry...' if round_num < MAX_ROUNDS else 'menyerah'}")
+                    logger.warning(f"[Turnstile] Putaran {round_num} gagal (45s) — {task_id}, {'retry...' if round_num < MAX_ROUNDS else 'menyerah'}")
                     # Simpan debug info di setiap putaran yang gagal
                     await self._save_debug_on_fail(page, task_id, round_num, url_with_slash)
 

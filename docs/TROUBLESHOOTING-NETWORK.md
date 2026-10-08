@@ -1,170 +1,119 @@
-## CF 求解的**三层策略**（按可靠性排序）
+# Cloudflare Turnstile 求解：完整诊断记录（2026-10-08）
 
-Turnstile Managed Challenge 的 token **只能由真实浏览器生成**（完整调查见下）。因此本网关提供三层应对，
-任一层可用即不中断：
-
-| 层级 | 方式 | 配置 | 依赖 | 适用 |
-|------|------|------|------|------|
-| **① 预置 cookie（最可靠）** | 你在自己浏览器里过一次 CF，把 cookie 交给网关 | `initial_cookies` | 只需一次浏览器 | **推荐**：cf_solver 挂 / 网络不稳时用它 |
-| **② 浏览器求解** | camoufox（`tools/cf_solver`） | `cf_solver_url` | 本机浏览器 + 网络 | 长期无人值守 |
-| **③ 第三方 API** | capsolver/2captcha（`tools/api_solver`） | `solver_urls` 追加 | 付费 key + 能访问其 API | 无本机浏览器时 |
-
-三者可**并存**：`solver_urls` 做轮询与故障转移；`initial_cookies` 命中时**完全不触发求解**。
-
-### ① 预置 cookie（一键采集）
-
-```bash
-# 1. 你自己浏览器打开 https://deepseek.es/ ，等页面能正常发消息（已过 Turnstile）
-# 2. F12 → Application → Cookies → 复制 dsts_ok 与 dsts 两行
-# 3. 交给网关（自动写入 config.json 的 initial_cookies）
-node scripts/collect-cookie.mjs --cookie "dsts_ok=1; dsts=<hash>"
-#    或从导出的 cookie 文件读：
-node scripts/collect-cookie.mjs --file cookies.txt
-```
-
-**有效期**：上游 `dsts` cookie 约 3.5 小时（见 `分析文档/06` §4.1），过期后重跑一次采集即可。
+> **本文档历经三次结论修正**。早期版本断言"网络出口中断"，后被实测推翻；
+> 中期归因于"点击坐标打偏"，也被推翻。**当前结论有可复现证据链支撑**，见 §3。
 
 ---
 
-## 为什么不能"纯协议"过 Turnstile（技术边界，已彻查）
+## 1. 症状
 
-**结论：不存在免费 + 无浏览器 + 纯协议的 Turnstile 解法**（已扫描 `D:\参考项目` 全部 1244 个项目）。
+- `tools/cf_solver` 返回 `{"status":"error","value":"captcha_fail"}`，耗时 ~93–117s。
+- 偶发成功（本机日志中 08:30 / 08:42 各一次，17–28s），故早期被误判为"抖动"。
+- 失败时 `.cf-turnstile` 容器存在，但**其中没有任何 iframe**。
 
-| 候选方案 | 为什么不行 |
-|---------|-----------|
-| `CloudFlareInvisibleSolver`（纯协议逆向） | 解的是 **`cf_clearance`（jsd 5秒盾）**，**不是 Turnstile widget token** |
-| `geetest-bypass` | 极验的，与 Cloudflare 无关 |
-| `Cloudflare-Faker` | Java 服务 + Chrome 扩展，**必须 GUI 机器** |
-| `captcha-solver` / `ohmycaptcha` | 仍需 CloakBrowser / Playwright 浏览器引擎 |
-| `cf-turnstile-token`（Peak API） | 纯 HTTP，但**付费第三方** |
-| `riskbypass_demo` | 契约最完整，但**付费第三方** |
+## 2. 已排除的假设（均有实测反证）
 
-**根因**：Turnstile token 是 Cloudflare 边缘在**服务端**签发的不透明串，其生成包含
-**服务端不可见的浏览器环境探测 + PoW**。客户端只能"真实地"让它生成，无法离线构造 ——
-除非持续逆向每次更新的 `api.js`（CF 频繁轮换），投入产出比极低。
+| 假设 | 反证 | 证据 |
+|------|------|------|
+| 网络出口中断 | **错** | `curl --ssl-no-revoke https://deepseek.es/` → 200；经 xray 10808 亦 200 |
+| `api.js` 不可达 | **错** | `curl -L` → 200，**86732 字节**；页面内 `fetch` 同样 200/86732 |
+| sitekey / origin 被拒 | **错** | 手动 `turnstile.render()` 能创建 widget 节点 |
+| 点击坐标打偏 | **错（此前误判）** | 修正为点击 iframe 内复选框后仍 3/3 失败；且实测 `iframe=0`，**根本无物可点** |
+| 轮询预算不足 | **错** | 45s→93s 预算下仍失败，且失败时无 token 到达 |
+| 路由拦截 abort 掉样式 | **已修** | 改为仅拦 image/media/font；`stylesheet` 放行 —— 未解决问题 |
+| camoufox 指纹被识别 | **错** | CF 正常下发并渲染 widget 容器，未触发硬拦截 |
 
-上层项目的 `imagefree-2ai/api/cf_clearance_solver.py` 自己也在文档里写明：
-「**不用于 Turnstile widget**（那是 cf_solver 浏览器求解）」。
+## 3. ✅ 确证根因（可复现证据链）
 
-### 已落地的改进（来自对参考项目的研究）
+**`window.turnstile` 在页面中从未被暴露。**
 
-- **`initial_cookies` + `scripts/collect-cookie.mjs`** —— 用你自己的浏览器当求解器，**零依赖**（本版本新增）。
-- **`tools/api_solver/`** —— 纯 HTTP 第三方 API 适配器（capsolver/2captcha），作为第三层（上一版本新增）。
-- **待办（有价值）**：借鉴 `captcha-solver` 的 **`verify_url` 同会话提交**机制（解决假页面 token 被
-  `invalid-input-response` 拒的问题）；借鉴 `riskbypass` 契约（返回配套 `ua`）。
-# CF 求解故障：精确定位与处置（2026-10-08）
+证据（`target/diag/probe3.py` / `probe11.py` / `probe13.py`）：
 
-> 本文档由实际探测得出，**每一步都有命令与输出**，非推测。
+```
+真实站点状态: {'ts': 'undefined', 'init': 'undefined',
+               'widgets': 1, 'ifr': 0, 'apiScript': True,
+               'apiSrc': '.../api.js?onload=deepseekTsInit&render=explicit'}
+```
 
-## 一句话结论
+即：`api.js` 标签存在且已加载、站点脚本已创建 `.deepseek-ts-widget` 容器，
+但 `typeof window.turnstile === 'undefined'` —— **Turnstile API 未初始化**。
 
-**xray 代理的上游节点已失效** → 浏览器无法到达 Cloudflare → Turnstile 求解 `captcha_fail`。
-**这是本机网络/代理配置问题，不是网关代码问题。**
+由此**完整因果链**：
 
-## 探测证据链
+1. 站点 `api.js?onload=deepseekTsInit&render=explicit` 加载后，需要回调
+   `window.deepseekTsInit` 存在，才会暴露 `window.turnstile`。
+2. 控制台明确报错（`probe9.py` 捕获原文）：
+   > `[Cloudflare Turnstile] Unable to find onload callback 'deepseekTsInit'
+   >  immediately after loading, expected 'function', got 'undefined'.`
+3. 该回调由站点内联脚本 `<script id="deepseek-ts-js">` 定义。实测该节点
+   **存在且内容完整（16392 字节）**，但**未执行**：
+   - `pageerror` 为空（非 JS 异常）
+   - `(0,eval)(s.textContent)` 手动执行 → `typeof window.deepseekTsInit`
+     立即变 `function`（`probe5.py`）
+4. 回调缺失 → `api.js` 不初始化 → 不暴露 `turnstile` → 站点 `scan()`/`process()`
+   拿不到 `window.turnstile` → widget 永不 render → 无 iframe → 无
+   `[name=cf-turnstile-response]` → `captcha_fail`。
 
-### 1. cf_solver 能跑，但求解失败
+**伴生现象**（同一环境的旁证）：
+```
+Failed to execute 'postMessage' on 'DOMWindow': The target origin provided
+('https://challenges.cloudflare.com') does not match the recipient window's
+origin ('https://deepseek.es').
+```
+该错误的 `file` 为主文档、`line: 0`，说明 `api.js` 与 CF challenge 端点的
+postMessage 握手在此环境下不成立 —— 与"API 未初始化"互为印证。
+
+## 4. 已实施的修复（真实落地的部分）
+
+`tools/cf_solver/api_server.py`：
+
+| # | 修复 | 状态 |
+|---|------|------|
+| 1 | **真实页面模式**：放弃伪造页（origin 错误），改为 `goto` 真实 `deepseek.es` | 已落地，实测 `已加载真实页面` |
+| 2 | **主动注册回调**：`eval` 站点 `#deepseek-ts-js`，使 `deepseekTsInit` 就位 | 已落地，实测 `eval ok -> function` |
+| 3 | `stylesheet` 不再 abort（避免 widget 布局失准） | 已落地 |
+| 4 | 点击改为定位 **iframe 内复选框**（左侧 30px）而非外层 div 中心 | 已落地 |
+| 5 | 轮询预算 18s → 45s/轮 ×2 轮 | 已落地 |
+| 6 | 假页面模板补上 `onloadTurnstileCallback` 定义 | 已落地（兜底路径） |
+
+**修复效果（诚实结论）**：修复 1–2 使流程推进到"`deepseekTsInit` 已注册"，
+但 `api.js` **仍未暴露 `window.turnstile`**（probe11 三轮均 `turnstile=undefined`）。
+**即：根因未被完全消除，`captcha_fail` 仍会发生。**
+
+## 5. 结论：这不是本项目代码可修的问题
+
+证据表明失败源于 **`api.js` 在 camoufox 环境下的初始化握手失败**，
+而非求解器逻辑缺陷。可能的环境因素（按可能性）：
+
+1. **出口 IP 风险分**：`129.146.124.201`（Oracle 机房段）→ CF 对 `api.js` 降级。
+2. **camoufox 指纹与 CF 反自动化**的兼容性（WebGL context lost、WebRTC ICE failed 等
+   在日志中反复出现）。
+3. 站点脚本在部分环境下不执行的**上游缺陷**（本项目无法控制）。
+
+## 6. 可用方案（按推荐度，均已在代码中就绪）
+
+| 方案 | 做法 | 状态 |
+|------|------|------|
+| **A. 预置 cookie** ⭐推荐 | 自己浏览器过一次 CF → `node scripts/collect-cookie.mjs --cookie "dsts_ok=1; dsts=<hash>"` | **已实现（v0.19.0）**，零 solver 依赖 |
+| **B. 第三方求解 API** | `tools/api_solver` + capsolver/2captcha key | **已实现（v0.18.0）** |
+| **C. 换出口 IP** | 给 solver 配家宽/移动代理，降低风险分 | 未验证 |
+| D. 继续调 solver | 需先解决 `api.js` 初始化握手 | **当前不可行** |
+
+## 7. 纯协议过 CF：不可行（最终结论）
+
+- 扫描 `D:\参考项目` **1244 个项目**：**不存在**「免费 + 无浏览器 + 纯协议」的
+  Turnstile 解法。
+- 唯一的纯协议逆向 `CloudFlareInvisibleSolver` 解的是 **`cf_clearance`（jsd 5秒盾）**，
+  与 Turnstile widget 无关（其代码中 `challenges.cloudflare.com`、
+  `cf-turnstile-response`、`sitekey`、`siteverify` **零命中**）。
+- 本站在 `/clearance` 端点实测 `cf_clearance: ""` → **站点本就没有 5秒盾**。
+- **原理**：Turnstile token 由 CF 边缘**服务端**签发，含浏览器环境探测 + PoW，
+  客户端无法离线构造。
+
+## 8. 复现命令
 
 ```bash
-curl -s "http://127.0.0.1:8001/turnstile?url=https%3A%2F%2Fdeepseek.es%2F&sitekey=0x4AAAAAADlLZ3ljqZP6cQwq&action=chat"
-# → {"task_id":"b36a...","status":"accepted"}          ← 服务正常
-curl -s "http://127.0.0.1:8001/result?id=b36a..."
-# → {"status":"error","elapsed_time":75.877,"value":"captcha_fail"}   ← 求解失败（75s 后才失败）
+# 根因复现（检查 window.turnstile 是否暴露）
+cd target/diag && PYTHONUTF8=1 <venv>/Scripts/python.exe probe13.py
+# 期望看到: {'ts': 'undefined', 'widgets': 1, 'ifr': 0, ...}
 ```
-
-### 2. 出口 TCP 全部不可达（直连）
-
-```bash
-timeout 5 bash -c 'echo > /dev/tcp/1.1.1.1/443'     # 不可达
-timeout 5 bash -c 'echo > /dev/tcp/8.8.8.8/53'      # 不可达
-```
-
-### 3. 代理进程在跑，但对境外的域名全不通
-
-```bash
-tasklist | grep 4332       # → xray.exe
-netstat -ano | grep LISTENING | grep 4332   # → 0.0.0.0:10808, 127.0.0.1:10812
-
-curl -x http://127.0.0.1:10808 -o /dev/null -w "%{http_code}" https://1.1.1.1/           # → 301 ✅
-curl -x http://127.0.0.1:10808 -o /dev/null -w "%{http_code}" https://www.cloudflare.com/  # → 000 ❌
-curl -x http://127.0.0.1:10808 -o /dev/null -w "%{http_code}" https://deepseek.es/          # → 000 ❌ (0.695s 即断)
-curl -x http://127.0.0.1:10808 -o /dev/null -w "%{http_code}" https://www.google.com/       # → 000 ❌
-curl -x http://127.0.0.1:10808 -o /dev/null -w "%{http_code}" https://api.github.com/       # → 000 ❌
-```
-
-**解读**：
-- `1.1.1.1`（Cloudflare 的公共 DNS）**在国内可直连**，所以它的 301 是**直连结果**，不是代理生效。
-- 一切**需要走代理出境**的域名**全部 000**（含 cloudflare.com 自身）。
-- `deepseek.es` 在 0.695s 内断开 —— **连接被拒**（非超时），典型的节点不可用表现。
-
-### 4. 代理软件确实是 xray
-
-```bash
-tasklist /FI "PID eq 4332"
-# → xray.exe        ← 代理内核
-```
-
-`0.0.0.0:10808` = 混合入站（HTTP+SOCKS）；`127.0.0.1:10812` = xray 的 API/其它入站。
-
-## 处置（需你侧操作）
-
-### 方案 A：更换/修复 xray 节点（**首选**）
-
-1. 打开你的代理客户端（v2rayN / Nekoray / Clash 等，内核是 xray）。
-2. **更新订阅**（节点可能已失效或被墙）。
-3. 切换到**可用的节点**，然后用命令验证：
-   ```bash
-   curl -x http://127.0.0.1:10808 -o /dev/null -w "%{http_code}\n" https://www.cloudflare.com/
-   # 期望：200 或 403（**不能是 000**）
-   ```
-4. 再验证目标站点：
-   ```bash
-   curl -x http://127.0.0.1:10808 -o /dev/null -w "%{http_code}\n" https://deepseek.es/
-   # 期望：200/403（非 000）
-   ```
-5. 两项都非 000 后，重启 cf_solver 并重跑 E2E：
-   ```bash
-   cd tools/cf_solver
-   "/c/Users/Administrator.DESKTOP-EGNE9ND/Desktop/2api目录/imagefree-2ai/.venv/Scripts/python.exe" boterdrop_wrapper.py
-   # 等 8001 LISTENING
-   node ../../scripts/e2e-v1.mjs
-   ```
-
-### 方案 B：改用第三方 captcha API（**已实现**，见 `tools/api_solver/`）
-
-若网络长期不稳，可完全绕开"本机出口"——由**第三方服务**（其服务器在墙外）代为求解：
-
-```bash
-API_SOLVER_KEY=<你的 capsolver/2captcha key> node tools/api_solver/server.mjs   # → :8002
-```
-```jsonc
-// config.json：camoufox 为主、API 为备
-{ "solver_urls": ["http://127.0.0.1:8001", "http://127.0.0.1:8002"] }
-```
-
-> 注意：**本机仍需能访问第三方 API 的域名**（capsolver.com / 2captcha.com）。
-> 若这些也走同一失效节点，方案 B 同样不通 —— 仍需先修节点（方案 A）。
-
-### 方案 C：仅在直连可达时使用
-
-若某段时间出口正常（`1.1.1.1` 与 `deepseek.es` 均通），则把 `proxy` 置为 `null` 直连：
-```jsonc
-{ "proxy": null }
-```
-实测本机**直连也不通**，故当前不可行；仅在未来网络环境变化时可用。
-
-## 为什么不能"纯协议求解"（技术边界，勿再尝试）
-
-deepseek.es 用的是 **Turnstile Managed Challenge**，三处证据：
-
-1. 上游 JS 注释：`// Turnstile rendern (Managed)`
-   （`抓包验证/deepseek-ts-security.js:99`）
-2. 页面含 `challenges.cloudflare.com/turnstile` widget（`抓包验证/home.html`，10 处引用）
-3. 上层项目 `imagefree-2ai/api/cf_clearance_solver.py` 文档明确：
-   「仅用于非敏感的 CF 5s 盾穿越，**不用于 Turnstile widget**（那是 cf_solver 浏览器求解）」
-
-**Managed Challenge 的 token 由 CF 服务端在验证 JS 执行 + 浏览器指纹后签发**，
-其**设计目标就是不可纯协议伪造**。上行项目里那个"纯协议"文件解决的是
-**cf_clearance（5 秒盾）**，与 Turnstile widget 是两回事。
-
-可行路径**只有**：① 浏览器求解（camoufox / cf_solver）；② 第三方求解服务（方案 B，已实现）。
