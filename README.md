@@ -107,6 +107,7 @@ claude
 | **用量账本** | `ledger_path` | SQLite 持久化（`usage.db`）；空 = 关闭 |
 | **多 solver 负载均衡** | `solver_urls` | 轮询 + 健康探测 + 故障转移；可混用浏览器与第三方 API 后端 |
 | **第三方 API solver** | `tools/api_solver` | 纯 HTTP 适配器（capsolver/2captcha），camoufox 宕机时接管 |
+| **预置 cookie** | `initial_cookies` | 用自己的浏览器过一次 CF，`scripts/collect-cookie.mjs` 采集，**零 solver 依赖** |
 | **语言注入** | `system_prompt_suffix` | 追加 system 指令（如"用用户语言回答"） |
 | **多轮对话** | — | 客户端发送的完整消息历史会被渲染进 prompt（见下） |
 | **工具调用** | — | 协议级 `tools`/`tool_calls`（OpenAI）与 `tools`/`tool_use`（Anthropic），见下 |
@@ -153,6 +154,7 @@ claude
 | `cf_solver_url` | `http://127.0.0.1:8001` | 求解器地址 |
 | `api_keys` | `[]` | 下游 Key；空 = 仅本机放行。支持 `"sk-x"` 或 `{"key":"sk-x","expires_at":<unix秒>}`（过期自动拒绝） |
 | `proxy` | `null` | 上游出口代理（如 `http://127.0.0.1:10808`） |
+| `initial_cookies` | `""` | 预置 cookie（`"dsts_ok=1; dsts=<hash>"`）—— **完全绕过 solver**，用 `scripts/collect-cookie.mjs` 采集 |
 | `user_agent` | `Chrome/150` | 浏览器 UA（**必须与 cf_solver 一致**，否则 cookie 绑定失败） |
 | `default_model` | `deepseek-es` | 默认模型 id（可自定义，`resolve_model` 据此回退） |
 | `solver_timeout_secs` | `120` | Turnstile 求解超时（秒） |

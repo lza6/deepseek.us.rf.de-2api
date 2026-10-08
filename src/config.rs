@@ -199,6 +199,15 @@ pub struct Config {
     /// 出口代理（可选，如 http://127.0.0.1:10808）
     #[serde(default)]
     pub proxy: Option<String>,
+    /// 预置 cookie（`"name=value; name2=value2"` 形式）。
+    ///
+    /// **用途**：当 cf_solver 不可用（浏览器起不来 / 第三方 API 未配 / 网络异常）时，
+    /// 可先在真实浏览器里访问目标站点过一次 Turnstile，再把 `dsts_ok=1` 等 cookie
+    /// 粘贴到此处交给网关——**完全绕过求解器**。
+    ///
+    /// 设置后启动即视为"已认证"（在 `cookie_ttl_secs` 内不再触发求解）。
+    #[serde(default)]
+    pub initial_cookies: String,
     /// 求解器超时（秒）
     #[serde(default = "default_solver_timeout")]
     pub solver_timeout_secs: u64,
@@ -283,6 +292,7 @@ impl Default for Config {
             default_model: default_model(),
             api_keys: vec![],
             proxy: None,
+            initial_cookies: String::new(),
             solver_timeout_secs: default_solver_timeout(),
             http_timeout_secs: default_http_timeout(),
             connect_timeout_secs: default_connect_timeout(),

@@ -29,6 +29,8 @@ jobs:
         run: cargo test --all
       - name: api_solver adapter tests
         run: node tools/api_solver/server.test.mjs
+      - name: collect-cookie parser tests
+        run: node scripts/collect-cookie.test.mjs
 
   docker:
     runs-on: ubuntu-latest

@@ -89,9 +89,27 @@ impl UpstreamClient {
             .build()
             .map_err(|e| AppError::Internal(format!("流式 HTTP 客户端构建失败: {e}")))?;
         let solver = Arc::new(SolverPool::new(&cfg)?);
+        // 预置 cookie：让运维用真实浏览器过一次 Turnstile 后把 cookie 交给网关，
+        // 从而在 cf_solver 不可用时**完全绕过求解器**（见 config.initial_cookies）。
+        let seeded = parse_cookie_header(&cfg.initial_cookies);
+        let seeded_ok = seeded.iter().any(|(k, v)| k == "dsts_ok" && v == "1");
+        if seeded_ok {
+            tracing::info!(
+                "已从配置载入 {} 个 cookie（含 dsts_ok），{} 秒内无需重新求解",
+                seeded.len(),
+                cfg.cookie_ttl_secs
+            );
+        }
         Ok(UpstreamClient {
             state: Mutex::new(AuthState {
                 bot_id: cfg.bot_id.clone(),
+                cookies: seeded,
+                // 有 dsts_ok 就记录获取时刻，使 TTL 判定生效
+                cookie_obtained: if seeded_ok {
+                    Some(Instant::now())
+                } else {
+                    None
+                },
                 ..Default::default()
             }),
             auth_lock: tokio::sync::Mutex::new(()),
@@ -887,6 +905,26 @@ pub fn parse_dsgt_config(html: &str) -> AppResult<DsgtConfig> {
     let cfg: DsgtConfig = serde_json::from_str(&body[..end])
         .map_err(|e| AppError::Upstream(format!("解析 dsgtConfig 失败: {e}")))?;
     Ok(cfg)
+}
+
+/// 解析 `"name=value; name2=value2"` 形式的 cookie 串（供 `initial_cookies` 使用）。
+///
+/// 宽容处理：忽略空段、无 `=` 的段、两侧空白。返回 (name, value) 列表。
+pub fn parse_cookie_header(s: &str) -> Vec<(String, String)> {
+    s.split(';')
+        .filter_map(|seg| {
+            let seg = seg.trim();
+            if seg.is_empty() {
+                return None;
+            }
+            let (k, v) = seg.split_once('=')?;
+            let k = k.trim();
+            if k.is_empty() {
+                return None;
+            }
+            Some((k.to_string(), v.trim().to_string()))
+        })
+        .collect()
 }
 
 /// 一个 SSE 事件。

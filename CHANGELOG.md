@@ -1,5 +1,39 @@
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/) 与 [语义化版本](https://semver.org/)。
 
+## [0.19.0] - 2026-10-08
+
+**CF 求解第三层：预置 cookie（用你自己的浏览器当求解器，零依赖）**。
+
+### Added
+- **`initial_cookies` 配置 + `scripts/collect-cookie.mjs`** —— 在 cf_solver 与第三方 API
+  都不可用时（浏览器起不来 / 网络不稳），可**在自己浏览器里过一次 Turnstile**，
+  把 `dsts_ok`/`dsts` cookie 交给网关，**完全绕过求解器**。
+  - 采集脚本支持粘贴串、JSON、Netscape cookies.txt；**掩码显示**不泄漏完整凭证。
+  - 网关启动时载入并视为已认证（`cookie_ttl_secs` 内不触发求解）。
+  - 测试：`initial_cookies_bypass_solver`（有 `dsts_ok` 时不调 solver）、
+    `initial_cookies_without_dsts_ok_still_solves`、`parse_cookie_header_variants`、
+    `collect-cookie.test.mjs`（9/9）。**已接入 CI**。
+- `docs/TROUBLESHOOTING-NETWORK.md` —— 三层 CF 策略 + 完整故障根因 + 逐条探测证据。
+
+### 调查结论（扫描 `D:\参考项目` 全部 1244 个项目）
+**不存在「免费 + 无浏览器 + 纯协议」的 Turnstile 解法**。逐条排除：
+- `CloudFlareInvisibleSolver`（唯一的纯协议逆向）解的是 **`cf_clearance`（jsd 5秒盾）**，
+  **不是 Turnstile widget token**（该项目的 `imagefree-2ai` 版本文档自己也写明「不用于 Turnstile」）。
+- `geetest-bypass`（极验，目标不同）、`Cloudflare-Faker`（必须 GUI）、
+  `captcha-solver` / `ohmycaptcha`（仍需浏览器引擎）—— 全都不满足。
+- `cf-turnstile-token`（Peak）/ `riskbypass_demo` —— 纯 HTTP 但**付费第三方**。
+
+**根因**：Turnstile token 由 Cloudflare 边缘**服务端**签发，生成过程含浏览器环境探测 + PoW，
+客户端无法离线构造。故可行路径只有「浏览器求解」与「第三方求解服务」两类。
+
+### Verified
+- `cargo test --all`：**145 单测 + 69 集成全绿**（新增 3 集成）；fmt / clippy 干净。
+- `node scripts/collect-cookie.test.mjs`：**9/9 通过**；`tools/api_solver/server.test.mjs`：**21/21**。
+- **实证**：用真实历史 cookie 启动网关 → 日志「已从配置载入…」且**未触发 Turnstile 求解**
+  （该 cookie 已过期故最终 502，但**绕过机制本身验证通过**）。
+- **真实 E2E 仍受阻**：本机网络出口中断（见诊断文档），恢复后重跑 `scripts/e2e-*.mjs`。
+
+---
 ## [0.18.0] - 2026-10-08
 
 **CF 求解可插拔**：新增纯 HTTP 的第三方 captcha API 适配器，解决 camoufox 单点故障。

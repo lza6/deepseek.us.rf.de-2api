@@ -2812,3 +2812,75 @@ async fn admin_token_sha256_config_works() {
         .unwrap();
     assert_eq!(r2.status(), 401, "错误明文应被拒");
 }
+
+// ── 预置 cookie：cf_solver 不可用时绕过求解 ──────────────────
+
+/// 配置 `initial_cookies` 含 `dsts_ok=1` 时，网关视为已认证 → **不调 solver**。
+#[tokio::test]
+async fn initial_cookies_bypass_solver() {
+    // solver 用"一直失败"的桩：若网关真去求解，必然 502
+    let base = serve_gateway(
+        spawn_mock_upstream().await,
+        spawn_mock_solver_fail().await,
+        |c| {
+            c.initial_cookies = "dsts_ok=1; wp_other=abc".into();
+            c.cookie_ttl_secs = 1800;
+        },
+    )
+    .await;
+    let r = reqwest::Client::new()
+        .post(format!("{base}/v1/chat/completions"))
+        .json(
+            &serde_json::json!({"model":"deepseek-es","messages":[{"role":"user","content":"hi"}]}),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        r.status(),
+        200,
+        "有预置 dsts_ok 时不应触发（会失败的）求解器，实际 {}",
+        r.status()
+    );
+}
+
+/// 无 `dsts_ok` 的预置 cookie **不**能绕过求解（必须仍走 solver）。
+#[tokio::test]
+async fn initial_cookies_without_dsts_ok_still_solves() {
+    let base = serve_gateway(
+        spawn_mock_upstream().await,
+        spawn_mock_solver_fail().await,
+        |c| c.initial_cookies = "some_other=1".into(),
+    )
+    .await;
+    let r = reqwest::Client::new()
+        .post(format!("{base}/v1/chat/completions"))
+        .json(
+            &serde_json::json!({"model":"deepseek-es","messages":[{"role":"user","content":"hi"}]}),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 502, "无 dsts_ok 应仍走 solver 并失败");
+}
+
+#[test]
+fn parse_cookie_header_variants() {
+    use deepseek_es_2api::upstream::parse_cookie_header;
+    assert_eq!(
+        parse_cookie_header("a=1; b=2"),
+        vec![("a".into(), "1".into()), ("b".into(), "2".into())]
+    );
+    // 宽容：空白、尾分号、无值段
+    assert_eq!(
+        parse_cookie_header("  x = y ;; z "),
+        vec![("x".into(), "y".into())],
+        "应忽略空段与无 = 段"
+    );
+    assert!(parse_cookie_header("").is_empty());
+    // 值内含 = 的情况（如 base64）
+    assert_eq!(
+        parse_cookie_header("t=abc=="),
+        vec![("t".into(), "abc==".into())]
+    );
+}
